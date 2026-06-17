@@ -1,0 +1,19 @@
+{
+  "name": "golf-trackr-osm-geometry-api",
+  "version": "1.0.0",
+  "description": "V1 OSM geometry API for Golf Trackr AI Caddy.",
+  "type": "module",
+  "main": "src/server.mjs",
+  "scripts": {
+    "start": "node src/server.mjs",
+    "dev": "node --watch src/server.mjs",
+    "check": "node --check src/server.mjs && node --check src/osmGolf.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2"
+  }
+}
