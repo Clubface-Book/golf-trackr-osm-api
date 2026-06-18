@@ -798,35 +798,8 @@ async function fetchCourseFeatureElements(course, { featureRadiusMeters }) {
     feature_radius_meters: featureRadiusMeters,
   });
 
-  const queries = [
-    {
-      name: "course_boundary",
-      query: `
-        [out:json][timeout:90];
-        ${course.type}(${course.id});
-        out body center;
-      `,
-    },
-    {
-      name: "golf_holes",
-      query: `
-        [out:json][timeout:90];
-        nwr["golf"="hole"](around:${featureRadiusMeters},${center.lat},${center.lng});
-        out body geom;
-      `,
-    },
-    {
-      name: "golf_greens",
-      query: `
-        [out:json][timeout:90];
-        nwr["golf"="green"](around:${featureRadiusMeters},${center.lat},${center.lng});
-        out body geom;
-      `,
-    },
-  ];
-
   const elements = [];
-  for (const { name, query } of queries) {
+  const runFeatureQuery = async (name, query) => {
     const queryStarted = Date.now();
     console.log("[geometry-build] stage:fetchCourseFeatureElements query_start", {
       query: name,
@@ -851,6 +824,26 @@ async function fetchCourseFeatureElements(course, { featureRadiusMeters }) {
         error: readableError(error),
       });
     }
+  };
+
+  await runFeatureQuery(
+    "golf_greens",
+    `
+      [out:json][timeout:90];
+      nwr["golf"="green"](around:${featureRadiusMeters},${center.lat},${center.lng});
+      out body geom;
+    `,
+  );
+
+  for (let holeRef = 1; holeRef <= 18; holeRef += 1) {
+    await runFeatureQuery(
+      `golf_hole_ref_${holeRef}`,
+      `
+        [out:json][timeout:90];
+        nwr["golf"="hole"]["ref"="${holeRef}"](around:${featureRadiusMeters},${center.lat},${center.lng});
+        out body geom;
+      `,
+    );
   }
 
   console.log("[geometry-build] stage:fetchCourseFeatureElements success", {
