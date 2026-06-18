@@ -729,7 +729,7 @@ async function fetchCourseByOsmId({ type, id }) {
     (
       ${type}(${id});
     );
-    out tags center geom;
+    out tags center;
   `;
 
   const data = await overpass(query, stage);
