@@ -83,7 +83,17 @@ export async function buildCourseGeometryForBubble(input) {
       osm_id: options.courseOsmId || null,
     });
 
-    const course = await resolveCourse(options);
+    const explicitOsmId = parseOsmId(options.courseOsmId);
+    const course = explicitOsmId ? minimalCourseFromExplicitOsmId(explicitOsmId, options) : await resolveCourse(options);
+
+    if (explicitOsmId) {
+      console.log("[geometry-build] stage:skipFetchCourseByOsmId explicit_osm_id", {
+        course_name: options.courseName,
+        course_key: options.courseKey,
+        osm_id: osmId(course),
+        center: courseCenter(course),
+      });
+    }
 
     if (!course) {
       console.log("[geometry-build] stage:resolveCourse no_course_found", {
@@ -939,6 +949,26 @@ function parseOsmId(value) {
   if (!value) return null;
   const match = String(value).trim().match(/^(node|way|relation)\/(\d+)$/i);
   return match ? { type: match[1].toLowerCase(), id: Number(match[2]) } : null;
+}
+
+function minimalCourseFromExplicitOsmId({ type, id }, options) {
+  const course = {
+    type,
+    id,
+    tags: {
+      name: options.courseName || null,
+      leisure: "golf_course",
+    },
+  };
+
+  if (Number.isFinite(options.lat) && Number.isFinite(options.lng)) {
+    course.center = {
+      lat: options.lat,
+      lon: options.lng,
+    };
+  }
+
+  return course;
 }
 
 function courseSummary(course) {
