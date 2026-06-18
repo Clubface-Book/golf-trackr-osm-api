@@ -798,23 +798,68 @@ async function fetchCourseFeatureElements(course, { featureRadiusMeters }) {
     feature_radius_meters: featureRadiusMeters,
   });
 
-  const query = `
-    [out:json][timeout:90];
-    (
-      ${course.type}(${course.id});
-      nwr["golf"~"^(hole|green)$"](around:${featureRadiusMeters},${center.lat},${center.lng});
-    );
-    out body geom;
-  `;
+  const queries = [
+    {
+      name: "course_boundary",
+      query: `
+        [out:json][timeout:90];
+        ${course.type}(${course.id});
+        out body center;
+      `,
+    },
+    {
+      name: "golf_holes",
+      query: `
+        [out:json][timeout:90];
+        nwr["golf"="hole"](around:${featureRadiusMeters},${center.lat},${center.lng});
+        out body geom;
+      `,
+    },
+    {
+      name: "golf_greens",
+      query: `
+        [out:json][timeout:90];
+        nwr["golf"="green"](around:${featureRadiusMeters},${center.lat},${center.lng});
+        out body geom;
+      `,
+    },
+  ];
 
-  const data = await overpass(query, stage);
+  const elements = [];
+  for (const { name, query } of queries) {
+    const queryStarted = Date.now();
+    console.log("[geometry-build] stage:fetchCourseFeatureElements query_start", {
+      query: name,
+      osm_id: osmId(course),
+    });
+
+    try {
+      const data = await overpass(query, `${stage}:${name}`);
+      const queryElements = data.elements || [];
+      elements.push(...queryElements);
+      console.log("[geometry-build] stage:fetchCourseFeatureElements query_success", {
+        query: name,
+        osm_id: osmId(course),
+        elapsed_ms: Date.now() - queryStarted,
+        elements: queryElements.length,
+      });
+    } catch (error) {
+      console.log("[geometry-build] stage:fetchCourseFeatureElements query_failed", {
+        query: name,
+        osm_id: osmId(course),
+        elapsed_ms: Date.now() - queryStarted,
+        error: readableError(error),
+      });
+    }
+  }
+
   console.log("[geometry-build] stage:fetchCourseFeatureElements success", {
     osm_id: osmId(course),
     elapsed_ms: Date.now() - started,
-    elements: data.elements?.length || 0,
+    elements: elements.length,
   });
 
-  return data.elements || [];
+  return elements;
 }
 
 async function overpass(query, stage = "overpass") {
