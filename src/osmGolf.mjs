@@ -39,6 +39,37 @@ export async function getAiCaddyGeometry(input) {
     lng: input.lng,
     selectedTeeName: input.selectedTeeName,
     currentYardage: input.currentYardage,
+    maxHazards: DEFAULT_MAX_HAZARDS,
+    storedHoleGeometry: input.storedHoleGeometry,
+  };
+
+  const storedGeometry = parseStoredHoleGeometry(options.storedHoleGeometry);
+  if (!storedGeometry) {
+    return withLog(
+      missingResponse({ input: options }),
+      {
+        geometry_source: "none",
+        fallback_reason: "stored_hole_geometry_missing_or_invalid",
+      },
+    );
+  }
+
+  const response = buildStoredAiCaddyResponse(storedGeometry, options);
+  return withLog(response, {
+    geometry_source: response.fallback_mode ? "fallback" : "stored_hole_geometry",
+    fallback_reason: response.fallback_mode ? "stored_hole_geometry_incomplete" : null,
+  });
+}
+
+export async function buildCourseGeometryForBubble(input) {
+  const attemptedAt = new Date().toISOString();
+  const options = {
+    courseName: input.courseName,
+    courseKey: input.courseKey,
+    courseId: input.courseId,
+    courseOsmId: input.courseOsmId,
+    lat: input.lat,
+    lng: input.lng,
     searchRadiusMeters: DEFAULT_SEARCH_RADIUS_METERS,
     featureRadiusMeters: DEFAULT_FEATURE_RADIUS_METERS,
     holeMatchMeters: DEFAULT_HOLE_MATCH_METERS,
@@ -49,38 +80,25 @@ export async function getAiCaddyGeometry(input) {
     const course = await resolveCourse(options);
 
     if (!course) {
-      return withLog(
-        missingResponse({
-          input: options,
-          course: null,
-          message: "Course was not found in OpenStreetMap.",
-          reason: "course_not_found",
-        }),
-        {
-          overpass_status: "succeeded",
-          overpass_error: "course_not_found",
-        },
-      );
+      return buildBubbleGeometryFallback({
+        input: options,
+        attemptedAt,
+        buildError: "course_not_found",
+      });
     }
 
     const geometry = await getCachedCourseGeometry(course, options);
-    return withLog(buildAiCaddyResponse(geometry, options), {
-      overpass_status: geometry.cache?.status === "hit" ? "cache_hit" : "succeeded",
-      overpass_error: null,
+    return buildBubbleGeometryResponse({
+      input: options,
+      geometry,
+      attemptedAt,
     });
   } catch (error) {
-    return withLog(
-      missingResponse({
-        input: options,
-        course: null,
-        message: "OSM geometry unavailable. Yardage-only fallback used.",
-        reason: "osm_geometry_unavailable",
-      }),
-      {
-        overpass_status: "failed",
-        overpass_error: readableError(error),
-      },
-    );
+    return buildBubbleGeometryFallback({
+      input: options,
+      attemptedAt,
+      buildError: readableError(error),
+    });
   }
 }
 
@@ -304,6 +322,354 @@ function missingResponse({ input }) {
     },
     attribution: ATTRIBUTION,
   };
+}
+
+function buildStoredAiCaddyResponse(storedGeometry, options) {
+  const userPoint = [options.lng, options.lat];
+  const green = storedGreen(storedGeometry);
+
+  if (!green) {
+    return missingResponse({ input: options });
+  }
+
+  const route = parseJsonValue(storedGeometry.route_json || storedGeometry.routeJson || storedGeometry.route) || {};
+  const bunkers = storedFeatures(storedGeometry.bunkers_json || storedGeometry.bunkersJson || storedGeometry.bunkers, "bunker");
+  const waterHazards = storedFeatures(
+    storedGeometry.water_json || storedGeometry.waterJson || storedGeometry.water_hazards || storedGeometry.waterHazards,
+    "water_hazard",
+  );
+  const hazardFallback = storedFeatures(
+    storedGeometry.hazards_json || storedGeometry.hazardsJson || storedGeometry.hazards,
+    "hazard",
+  );
+  const nearestBunkers = nearestStoredFeatures(
+    bunkers.length ? bunkers : hazardFallback.filter((feature) => feature.type === "bunker"),
+    userPoint,
+    options.maxHazards,
+  );
+  const nearestWaterHazards = nearestStoredFeatures(
+    waterHazards.length ? waterHazards : hazardFallback.filter((feature) => feature.type !== "bunker"),
+    userPoint,
+    options.maxHazards,
+  );
+  const geometryStatus = normalizeGeometryStatus(storedGeometry.geometry_status || storedGeometry.geometryStatus);
+  const mappingStatus = geometryStatus === "partial" ? "partial" : "full";
+
+  return {
+    ok: true,
+    mapping_status: mappingStatus,
+    geometry_available: true,
+    fallback_mode: mappingStatus === "partial" ? "partial_geometry" : null,
+    course: {
+      name: options.courseName || null,
+      osm_id: options.courseOsmId || null,
+      attribution: ATTRIBUTION,
+    },
+    hole: options.hole,
+    selected_tee_name: options.selectedTeeName || null,
+    current_yardage: options.currentYardage,
+    green: {
+      osm_id: green.osm_id || storedGeometry.green_osm_id || storedGeometry.greenOsmId || "",
+      center: green.center,
+      distance_from_user_yards: yardsBetween(userPoint, [green.center.lng, green.center.lat]),
+      match: green.match || null,
+    },
+    nearest_bunkers: nearestBunkers,
+    nearest_water_hazards: nearestWaterHazards,
+    route,
+    data_quality: {
+      confidence: mappingStatus === "full" ? "high" : "medium",
+      boundary_available: false,
+      hole_route_found: Boolean(route?.osm_id || storedGeometry.route_osm_id || storedGeometry.routeOsmId),
+      green_found: true,
+      notes: storedQualityNotes(storedGeometry, mappingStatus),
+    },
+    attribution: ATTRIBUTION,
+  };
+}
+
+function parseStoredHoleGeometry(value) {
+  const parsed = parseJsonValue(value);
+  if (!parsed || typeof parsed !== "object") return null;
+
+  const geometryStatus = normalizeGeometryStatus(parsed.geometry_status || parsed.geometryStatus);
+  if (geometryStatus === "missing") return null;
+
+  return parsed;
+}
+
+function storedGreen(storedGeometry) {
+  const greenJson = parseJsonValue(storedGeometry.green_json || storedGeometry.greenJson || storedGeometry.green) || {};
+  const greenLat = finiteNumber(storedGeometry.green_lat ?? storedGeometry.greenLat ?? greenJson.center?.lat);
+  const greenLng = finiteNumber(storedGeometry.green_lng ?? storedGeometry.greenLng ?? greenJson.center?.lng);
+
+  if (!Number.isFinite(greenLat) || !Number.isFinite(greenLng)) return null;
+
+  return {
+    ...greenJson,
+    osm_id: greenJson.osm_id || storedGeometry.green_osm_id || storedGeometry.greenOsmId || "",
+    center: {
+      lat: roundCoord(greenLat),
+      lng: roundCoord(greenLng),
+    },
+  };
+}
+
+function storedFeatures(value, fallbackType) {
+  const parsed = parseJsonValue(value);
+  const list = Array.isArray(parsed) ? parsed : [];
+
+  return list
+    .map((feature) => normalizeStoredFeature(feature, fallbackType))
+    .filter(Boolean);
+}
+
+function normalizeStoredFeature(feature, fallbackType) {
+  if (!feature || typeof feature !== "object") return null;
+
+  const lat = finiteNumber(feature.center?.lat ?? feature.lat);
+  const lng = finiteNumber(feature.center?.lng ?? feature.lng);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
+
+  return {
+    type: feature.type || fallbackType,
+    osm_id: feature.osm_id || "",
+    center: {
+      lat: roundCoord(lat),
+      lng: roundCoord(lng),
+    },
+    match: feature.match || null,
+  };
+}
+
+function nearestStoredFeatures(features, userPoint, maxCount) {
+  return features
+    .map((feature) => ({
+      type: outputHazardType(feature.type),
+      osm_id: feature.osm_id,
+      center: feature.center,
+      distance_from_user_yards: yardsBetween(userPoint, [feature.center.lng, feature.center.lat]),
+      match: feature.match || null,
+    }))
+    .sort((a, b) => a.distance_from_user_yards - b.distance_from_user_yards)
+    .slice(0, maxCount);
+}
+
+function storedQualityNotes(storedGeometry, mappingStatus) {
+  const parsed = parseJsonValue(storedGeometry.quality_notes_json || storedGeometry.qualityNotesJson);
+  if (Array.isArray(parsed) && parsed.length) return parsed;
+  return mappingStatus === "full"
+    ? ["Stored course geometry used."]
+    : ["Stored partial course geometry used."];
+}
+
+function normalizeGeometryStatus(value) {
+  const status = String(value || "").toLowerCase();
+  if (status === "full" || status === "partial") return status;
+  return "missing";
+}
+
+function parseJsonValue(value) {
+  if (!value) return null;
+  if (typeof value === "object") return value;
+
+  try {
+    return JSON.parse(value);
+  } catch {
+    return null;
+  }
+}
+
+function finiteNumber(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : NaN;
+}
+
+function buildBubbleGeometryResponse({ input, geometry, attemptedAt }) {
+  const holeRecords = geometry.holeRefsFound.map((holeNumber) =>
+    buildBubbleHoleGeometryRecord({
+      geometry,
+      holeNumber,
+      updatedAt: attemptedAt,
+    }),
+  );
+  const mappingStatus = classifyCourseGeometryStatus(holeRecords, geometry);
+  const geometryAvailable = mappingStatus !== "missing";
+  const builtAt = attemptedAt;
+
+  return {
+    ok: true,
+    build_status: "ready",
+    mapping_status: mappingStatus,
+    geometry_available: geometryAvailable,
+    course_key: input.courseKey,
+    course_id: input.courseId || null,
+    course_geometry: {
+      course_key: input.courseKey,
+      course_name: geometry.course.tags?.name || input.courseName || null,
+      osm_id: osmId(geometry.course),
+      mapping_status: mappingStatus,
+      build_status: "ready",
+      geometry_available: geometryAvailable,
+      source: "osm",
+      attribution: ATTRIBUTION,
+      features_count_json: stringifyJson(geometry.featureCounts),
+      hole_refs_found_json: stringifyJson(geometry.holeRefsFound),
+      quality_notes_json: stringifyJson(courseQualityNotes(mappingStatus, holeRecords)),
+      raw_course_json: stringifyJson(rawCourseForBubble(geometry)),
+      build_error: "",
+      last_build_attempt_at: attemptedAt,
+      built_at: builtAt,
+    },
+    course_hole_geometries: holeRecords,
+    attribution: ATTRIBUTION,
+  };
+}
+
+function buildBubbleGeometryFallback({ input, attemptedAt, buildError }) {
+  return {
+    ok: true,
+    build_status: "failed",
+    mapping_status: "missing",
+    geometry_available: false,
+    course_key: input.courseKey,
+    course_id: input.courseId || null,
+    course_geometry: {
+      course_key: input.courseKey,
+      course_name: input.courseName || null,
+      osm_id: "",
+      mapping_status: "missing",
+      build_status: "failed",
+      geometry_available: false,
+      source: "osm",
+      attribution: ATTRIBUTION,
+      features_count_json: "{}",
+      hole_refs_found_json: "[]",
+      quality_notes_json: stringifyJson(["OSM geometry unavailable. Yardage-only fallback should be used."]),
+      raw_course_json: "{}",
+      build_error: buildError || "osm_geometry_unavailable",
+      last_build_attempt_at: attemptedAt,
+      built_at: null,
+    },
+    course_hole_geometries: [],
+    attribution: ATTRIBUTION,
+  };
+}
+
+function buildBubbleHoleGeometryRecord({ geometry, holeNumber, updatedAt }) {
+  const holeRecord = geometry.holeMap.get(holeNumber) || { holeRoutes: [], features: [] };
+  const holeRoutes = holeRecord.holeRoutes || [];
+  const primaryRoute = holeRoutes[0] || null;
+  const features = holeRecord.features || [];
+  const greens = features.filter((feature) => feature.kind === "green");
+  const tees = features.filter((feature) => feature.kind === "tee");
+  const bunkers = features.filter((feature) => feature.kind === "bunker");
+  const waterHazards = features.filter((feature) => isWaterKind(feature.kind));
+  const fairways = features.filter((feature) => feature.kind === "fairway");
+  const primaryGreen = pickPrimaryGreen(greens, primaryRoute);
+  const geometryStatus = classifyHoleGeometryStatus({
+    holeRecord,
+    primaryRoute,
+    primaryGreen,
+    features,
+  });
+  const green = primaryGreen ? bubbleFeature(primaryGreen) : null;
+  const route = primaryRoute ? bubbleRoute(primaryRoute) : null;
+  const teeRecords = tees.map((feature) => bubbleFeature(feature));
+  const bunkerRecords = bunkers.map((feature) => ({ type: "bunker", ...bubbleFeature(feature) }));
+  const waterRecords = waterHazards.map((feature) => ({ type: outputHazardType(feature.kind), ...bubbleFeature(feature) }));
+  const fairwayRecords = fairways.map((feature) => bubbleFeature(feature));
+  const hazardRecords = [...bunkerRecords, ...waterRecords];
+  const notes =
+    geometryStatus === "missing"
+      ? ["No usable OSM geometry found for this hole."]
+      : qualityNotes(geometry, { hole: holeNumber }, primaryRoute, primaryGreen);
+
+  return {
+    hole_number: holeNumber,
+    hole_ref: primaryRoute?.element.tags?.ref || String(holeNumber),
+    green_lat: primaryGreen ? roundCoord(primaryGreen.center[1]) : null,
+    green_lng: primaryGreen ? roundCoord(primaryGreen.center[0]) : null,
+    green_osm_id: primaryGreen ? osmId(primaryGreen.element) : "",
+    route_osm_id: primaryRoute ? osmId(primaryRoute.element) : "",
+    route_json: stringifyJson(route || {}),
+    tees_json: stringifyJson(teeRecords),
+    bunkers_json: stringifyJson(bunkerRecords),
+    water_json: stringifyJson(waterRecords),
+    hazards_json: stringifyJson(hazardRecords),
+    fairway_json: stringifyJson(fairwayRecords),
+    green_json: stringifyJson(green || {}),
+    geometry_status: geometryStatus,
+    quality_notes_json: stringifyJson(notes),
+    last_updated_at: updatedAt,
+  };
+}
+
+function classifyCourseGeometryStatus(holeRecords, geometry) {
+  const usefulFeatureCount = Object.entries(geometry.featureCounts)
+    .filter(([kind]) => kind !== "other")
+    .reduce((total, [, count]) => total + count, 0);
+
+  if (!usefulFeatureCount || !holeRecords.length) return "missing";
+
+  const fullHoles = new Set(
+    holeRecords.filter((record) => record.geometry_status === "full").map((record) => record.hole_number),
+  );
+  const hasFullFrontNine = Array.from({ length: 9 }, (_, index) => index + 1).every((hole) => fullHoles.has(hole));
+  const hasFullEighteen = Array.from({ length: 18 }, (_, index) => index + 1).every((hole) => fullHoles.has(hole));
+
+  if (hasFullEighteen || hasFullFrontNine) return "full";
+  if (holeRecords.some((record) => record.geometry_status !== "missing")) return "partial";
+  return "missing";
+}
+
+function classifyHoleGeometryStatus({ holeRecord, primaryRoute, primaryGreen, features }) {
+  if (primaryRoute && primaryGreen) return "full";
+  if (holeRecord && (primaryRoute || primaryGreen || features.length > 0)) return "partial";
+  return "missing";
+}
+
+function courseQualityNotes(mappingStatus, holeRecords) {
+  if (mappingStatus === "full") {
+    return ["Course geometry built from OSM.", "All primary hole geometry found for a complete 9 or 18 hole set."];
+  }
+
+  if (mappingStatus === "partial") {
+    return ["Course geometry built from OSM.", "Some hole geometry is incomplete."];
+  }
+
+  return ["Course found in OSM, but no usable hole-level geometry was found."];
+}
+
+function rawCourseForBubble(geometry) {
+  return {
+    name: geometry.course.tags?.name || null,
+    osm_id: osmId(geometry.course),
+    center: courseCenter(geometry.course),
+    boundary_available: isClosedRing(geometry.courseBoundary),
+    tags: geometry.course.tags || {},
+  };
+}
+
+function bubbleRoute(route) {
+  return {
+    osm_id: osmId(route.element),
+    ref: String(route.ref),
+    par: route.element.tags?.par || null,
+    coordinates: route.line.map(([lng, lat]) => ({ lat: roundCoord(lat), lng: roundCoord(lng) })),
+  };
+}
+
+function bubbleFeature(feature) {
+  return {
+    osm_id: osmId(feature.element),
+    center: latLng(feature.center),
+    match: feature.match || null,
+  };
+}
+
+function stringifyJson(value) {
+  return JSON.stringify(value);
 }
 
 async function fetchCourseByOsmId({ type, id }) {
