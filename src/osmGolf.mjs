@@ -803,8 +803,6 @@ async function fetchCourseFeatureElements(course, { featureRadiusMeters }) {
     (
       ${course.type}(${course.id});
       nwr["golf"~"^(hole|tee|fairway|bunker|green|water_hazard|lateral_water_hazard)$"](around:${featureRadiusMeters},${center.lat},${center.lng});
-      nwr["natural"="water"](around:${featureRadiusMeters},${center.lat},${center.lng});
-      nwr["water"](around:${featureRadiusMeters},${center.lat},${center.lng});
     );
     out body geom;
   `;
