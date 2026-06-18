@@ -1,4 +1,5 @@
 const OVERPASS_URL = process.env.OVERPASS_URL || "https://overpass-api.de/api/interpreter";
+const OVERPASS_TIMEOUT_MS = Number(process.env.OVERPASS_TIMEOUT_MS || 15000);
 const YARDS_PER_METER = 1.0936132983377078;
 const DEFAULT_CACHE_TTL_MS = Number(process.env.COURSE_CACHE_TTL_MS || 30 * 24 * 60 * 60 * 1000);
 const DEFAULT_SEARCH_RADIUS_METERS = Number(process.env.SEARCH_RADIUS_METERS || 5000);
@@ -44,19 +45,43 @@ export async function getAiCaddyGeometry(input) {
     maxHazards: DEFAULT_MAX_HAZARDS,
   };
 
-  const course = await resolveCourse(options);
+  try {
+    const course = await resolveCourse(options);
 
-  if (!course) {
-    return missingResponse({
-      input: options,
-      course: null,
-      message: "Course was not found in OpenStreetMap.",
-      reason: "course_not_found",
+    if (!course) {
+      return withLog(
+        missingResponse({
+          input: options,
+          course: null,
+          message: "Course was not found in OpenStreetMap.",
+          reason: "course_not_found",
+        }),
+        {
+          overpass_status: "succeeded",
+          overpass_error: "course_not_found",
+        },
+      );
+    }
+
+    const geometry = await getCachedCourseGeometry(course, options);
+    return withLog(buildAiCaddyResponse(geometry, options), {
+      overpass_status: geometry.cache?.status === "hit" ? "cache_hit" : "succeeded",
+      overpass_error: null,
     });
+  } catch (error) {
+    return withLog(
+      missingResponse({
+        input: options,
+        course: null,
+        message: "OSM geometry unavailable. Yardage-only fallback used.",
+        reason: "osm_geometry_unavailable",
+      }),
+      {
+        overpass_status: "failed",
+        overpass_error: readableError(error),
+      },
+    );
   }
-
-  const geometry = await getCachedCourseGeometry(course, options);
-  return buildAiCaddyResponse(geometry, options);
 }
 
 async function resolveCourse(options) {
@@ -252,34 +277,30 @@ function classifyMappingStatus({ geometry, holeRecord, primaryRoute, primaryGree
   return "missing";
 }
 
-function missingResponse({ input, course, geometry = null, message, reason }) {
+function missingResponse({ input }) {
   return {
     ok: true,
     mapping_status: "missing",
     geometry_available: false,
     fallback_mode: "yardage_only",
-    reason,
-    message,
-    course: course ? courseSummary(course) : null,
+    course: {
+      name: input.courseName || null,
+      osm_id: null,
+      attribution: ATTRIBUTION,
+    },
     hole: input.hole,
     selected_tee_name: input.selectedTeeName || null,
     current_yardage: input.currentYardage,
     green: null,
     nearest_bunkers: [],
     nearest_water_hazards: [],
-    route: null,
+    route: {},
     data_quality: {
-      confidence: "low",
-      boundary_available: geometry ? isClosedRing(geometry.courseBoundary) : false,
+      confidence: "none",
+      boundary_available: false,
       hole_route_found: false,
       green_found: false,
-      hole_refs_found: geometry?.holeRefsFound || [],
-      feature_counts_inside_course: geometry?.featureCounts || {},
-      cache: geometry?.cache || null,
-      notes: [
-        "Bubble should use yardage, par, stroke index, tee, handicap, and general strategy only.",
-        "Do not ask AI Caddy to invent bunkers, water hazards, or green geometry for this course.",
-      ],
+      notes: ["OSM geometry unavailable. Yardage-only fallback used."],
     },
     attribution: ATTRIBUTION,
   };
@@ -338,20 +359,40 @@ async function fetchCourseFeatureElements(course, { featureRadiusMeters }) {
 }
 
 async function overpass(query) {
-  const response = await fetch(OVERPASS_URL, {
-    method: "POST",
-    headers: {
-      "content-type": "text/plain",
-      "user-agent": "Golf Trackr AI Caddy OSM Geometry API",
-    },
-    body: query,
-  });
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), OVERPASS_TIMEOUT_MS);
 
-  if (!response.ok) {
-    throw new Error(`Overpass request failed: ${response.status} ${await response.text()}`);
+  try {
+    const response = await fetch(OVERPASS_URL, {
+      method: "POST",
+      headers: {
+        "content-type": "text/plain",
+        "user-agent": "Golf Trackr AI Caddy OSM Geometry API",
+      },
+      body: query,
+      signal: controller.signal,
+    });
+
+    if (!response.ok) {
+      const body = await response.text();
+      const error = new Error(`Overpass request failed with HTTP ${response.status}`);
+      error.status = response.status;
+      error.responseBody = body.slice(0, 300);
+      throw error;
+    }
+
+    return response.json();
+  } catch (error) {
+    if (error.name === "AbortError") {
+      const timeoutError = new Error(`Overpass timed out after ${OVERPASS_TIMEOUT_MS}ms`);
+      timeoutError.code = "overpass_timeout";
+      throw timeoutError;
+    }
+
+    throw error;
+  } finally {
+    clearTimeout(timeout);
   }
-
-  return response.json();
 }
 
 function ensureHoleRecord(holeMap, ref) {
@@ -624,4 +665,16 @@ function countBy(items, key) {
     counts[value] = (counts[value] || 0) + 1;
     return counts;
   }, {});
+}
+
+function withLog(response, log) {
+  response._log = log;
+  return response;
+}
+
+function readableError(error) {
+  if (!error) return "unknown_error";
+  if (error.status) return `HTTP ${error.status}`;
+  if (error.code) return error.code;
+  return error.message || "unknown_error";
 }

@@ -47,8 +47,25 @@ app.get("/health", (req, res) => {
 app.post("/v1/geometry/ai-caddy", async (req, res) => {
   try {
     const input = validateRequest(req.body || {});
+    console.log("[ai-caddy] incoming", {
+      course_name: input.courseName,
+      hole: input.hole,
+    });
+
     const result = await getAiCaddyGeometry(input);
-    res.json(result);
+    const log = result._log || {};
+    delete result._log;
+
+    console.log("[ai-caddy] completed", {
+      course_name: input.courseName,
+      hole: input.hole,
+      overpass: log.overpass_status || "unknown",
+      overpass_error: log.overpass_error || null,
+      mapping_status: result.mapping_status,
+      fallback_mode: result.fallback_mode || null,
+    });
+
+    res.status(200).json(result);
   } catch (error) {
     if (error.statusCode) {
       res.status(error.statusCode).json({
