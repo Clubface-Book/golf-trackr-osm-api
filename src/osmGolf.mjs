@@ -802,7 +802,7 @@ async function fetchCourseFeatureElements(course, { featureRadiusMeters }) {
     [out:json][timeout:90];
     (
       ${course.type}(${course.id});
-      nwr["golf"~"^(hole|tee|fairway|bunker|green|water_hazard|lateral_water_hazard)$"](around:${featureRadiusMeters},${center.lat},${center.lng});
+      nwr["golf"~"^(hole|green)$"](around:${featureRadiusMeters},${center.lat},${center.lng});
     );
     out body geom;
   `;
