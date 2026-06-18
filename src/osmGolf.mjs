@@ -77,9 +77,19 @@ export async function buildCourseGeometryForBubble(input) {
   };
 
   try {
+    console.log("[geometry-build] stage:start", {
+      course_name: options.courseName,
+      course_key: options.courseKey,
+      osm_id: options.courseOsmId || null,
+    });
+
     const course = await resolveCourse(options);
 
     if (!course) {
+      console.log("[geometry-build] stage:resolveCourse no_course_found", {
+        course_name: options.courseName,
+        course_key: options.courseKey,
+      });
       return buildBubbleGeometryFallback({
         input: options,
         attemptedAt,
@@ -87,13 +97,35 @@ export async function buildCourseGeometryForBubble(input) {
       });
     }
 
+    console.log("[geometry-build] stage:resolveCourse success", {
+      course_name: options.courseName,
+      course_key: options.courseKey,
+      osm_id: osmId(course),
+    });
+
     const geometry = await getCachedCourseGeometry(course, options);
+    console.log("[geometry-build] stage:buildCourseGeometry success", {
+      course_name: options.courseName,
+      course_key: options.courseKey,
+      osm_id: osmId(course),
+      feature_counts: geometry.featureCounts,
+      hole_refs_found: geometry.holeRefsFound,
+      cache_status: geometry.cache?.status || null,
+    });
+
     return buildBubbleGeometryResponse({
       input: options,
       geometry,
       attemptedAt,
     });
   } catch (error) {
+    console.log("[geometry-build] stage:failed", {
+      course_name: options.courseName,
+      course_key: options.courseKey,
+      failing_stage: error.stage || "unknown",
+      error: readableError(error),
+    });
+
     return buildBubbleGeometryFallback({
       input: options,
       attemptedAt,
@@ -105,11 +137,18 @@ export async function buildCourseGeometryForBubble(input) {
 async function resolveCourse(options) {
   const explicitOsmId = parseOsmId(options.courseOsmId);
   if (explicitOsmId) {
+    console.log("[geometry-build] stage:resolveCourse explicit_osm_id", {
+      osm_id: `${explicitOsmId.type}/${explicitOsmId.id}`,
+    });
     return fetchCourseByOsmId(explicitOsmId);
   }
 
   const knownCourse = knownCourseForName(options.courseName);
   if (knownCourse) {
+    console.log("[geometry-build] stage:resolveCourse known_course", {
+      course_name: options.courseName,
+      osm_id: `${knownCourse.osmType}/${knownCourse.osmId}`,
+    });
     const course = await fetchCourseByOsmId({
       type: knownCourse.osmType,
       id: knownCourse.osmId,
@@ -118,6 +157,12 @@ async function resolveCourse(options) {
     if (course) return course;
   }
 
+  console.log("[geometry-build] stage:resolveCourse name_search", {
+    course_name: options.courseName,
+    lat: options.lat,
+    lng: options.lng,
+    search_radius_meters: options.searchRadiusMeters,
+  });
   return findCourseByName(options);
 }
 
@@ -673,6 +718,12 @@ function stringifyJson(value) {
 }
 
 async function fetchCourseByOsmId({ type, id }) {
+  const stage = "fetchCourseByOsmId";
+  const started = Date.now();
+  console.log("[geometry-build] stage:fetchCourseByOsmId start", {
+    osm_id: `${type}/${id}`,
+  });
+
   const query = `
     [out:json][timeout:60];
     (
@@ -681,11 +732,26 @@ async function fetchCourseByOsmId({ type, id }) {
     out tags center geom;
   `;
 
-  const data = await overpass(query);
+  const data = await overpass(query, stage);
+  console.log("[geometry-build] stage:fetchCourseByOsmId success", {
+    osm_id: `${type}/${id}`,
+    elapsed_ms: Date.now() - started,
+    elements: data.elements?.length || 0,
+  });
+
   return (data.elements || [])[0] || null;
 }
 
 async function findCourseByName({ courseName, lat, lng, searchRadiusMeters }) {
+  const stage = "findCourseByName";
+  const started = Date.now();
+  console.log("[geometry-build] stage:findCourseByName start", {
+    course_name: courseName,
+    lat,
+    lng,
+    search_radius_meters: searchRadiusMeters,
+  });
+
   const escaped = escapeOverpassRegex(courseName);
   const query = `
     [out:json][timeout:60];
@@ -695,9 +761,14 @@ async function findCourseByName({ courseName, lat, lng, searchRadiusMeters }) {
     out tags center geom;
   `;
 
-  const data = await overpass(query);
+  const data = await overpass(query, stage);
   const courses = data.elements || [];
   const userPoint = [lng, lat];
+  console.log("[geometry-build] stage:findCourseByName success", {
+    course_name: courseName,
+    elapsed_ms: Date.now() - started,
+    candidates: courses.length,
+  });
 
   return courses
     .map((course) => ({
@@ -708,7 +779,15 @@ async function findCourseByName({ courseName, lat, lng, searchRadiusMeters }) {
 }
 
 async function fetchCourseFeatureElements(course, { featureRadiusMeters }) {
+  const stage = "fetchCourseFeatureElements";
+  const started = Date.now();
   const center = courseCenter(course);
+  console.log("[geometry-build] stage:fetchCourseFeatureElements start", {
+    osm_id: osmId(course),
+    center,
+    feature_radius_meters: featureRadiusMeters,
+  });
+
   const query = `
     [out:json][timeout:90];
     (
@@ -720,13 +799,24 @@ async function fetchCourseFeatureElements(course, { featureRadiusMeters }) {
     out body geom;
   `;
 
-  const data = await overpass(query);
+  const data = await overpass(query, stage);
+  console.log("[geometry-build] stage:fetchCourseFeatureElements success", {
+    osm_id: osmId(course),
+    elapsed_ms: Date.now() - started,
+    elements: data.elements?.length || 0,
+  });
+
   return data.elements || [];
 }
 
-async function overpass(query) {
+async function overpass(query, stage = "overpass") {
   const controller = new AbortController();
+  const started = Date.now();
   const timeout = setTimeout(() => controller.abort(), OVERPASS_TIMEOUT_MS);
+  console.log("[geometry-build] stage:overpass start", {
+    stage,
+    timeout_ms: OVERPASS_TIMEOUT_MS,
+  });
 
   try {
     const response = await fetch(OVERPASS_URL, {
@@ -744,17 +834,40 @@ async function overpass(query) {
       const error = new Error(`Overpass request failed with HTTP ${response.status}`);
       error.status = response.status;
       error.responseBody = body.slice(0, 300);
+      error.stage = stage;
+      console.log("[geometry-build] stage:overpass http_error", {
+        stage,
+        status: response.status,
+        elapsed_ms: Date.now() - started,
+      });
       throw error;
     }
 
-    return response.json();
+    const data = await response.json();
+    console.log("[geometry-build] stage:overpass success", {
+      stage,
+      elapsed_ms: Date.now() - started,
+      elements: data.elements?.length || 0,
+    });
+    return data;
   } catch (error) {
     if (error.name === "AbortError") {
       const timeoutError = new Error(`Overpass timed out after ${OVERPASS_TIMEOUT_MS}ms`);
       timeoutError.code = "overpass_timeout";
+      timeoutError.stage = stage;
+      console.log("[geometry-build] stage:overpass timeout", {
+        stage,
+        elapsed_ms: Date.now() - started,
+        timeout_ms: OVERPASS_TIMEOUT_MS,
+      });
       throw timeoutError;
     }
 
+    console.log("[geometry-build] stage:overpass error", {
+      stage: error.stage || stage,
+      elapsed_ms: Date.now() - started,
+      error: readableError(error),
+    });
     throw error;
   } finally {
     clearTimeout(timeout);
