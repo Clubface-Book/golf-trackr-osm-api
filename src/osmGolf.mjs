@@ -808,7 +808,7 @@ async function fetchCourseFeatureElements(course, { featureRadiusMeters }) {
         osm_id: osmId(course),
         reason: "total_budget_exhausted",
       });
-      return false;
+      return null;
     }
 
     const queryStarted = Date.now();
@@ -828,6 +828,7 @@ async function fetchCourseFeatureElements(course, { featureRadiusMeters }) {
         elapsed_ms: Date.now() - queryStarted,
         elements: queryElements.length,
       });
+      return queryElements;
     } catch (error) {
       console.log("[geometry-build] stage:fetchCourseFeatureElements query_failed", {
         query: name,
@@ -837,7 +838,7 @@ async function fetchCourseFeatureElements(course, { featureRadiusMeters }) {
       });
     }
 
-    return remainingBudgetMs() > 0;
+    return [];
   };
 
   await runFeatureQuery(
@@ -849,8 +850,25 @@ async function fetchCourseFeatureElements(course, { featureRadiusMeters }) {
     `,
   );
 
+  const allHoleElements =
+    (await runFeatureQuery(
+      "golf_holes",
+      `
+        [out:json][timeout:90];
+        way["golf"="hole"](around:${featureRadiusMeters},${center.lat},${center.lng});
+        out geom;
+      `,
+    )) || [];
+  const foundHoleRefs = new Set(validHoleRefsFromElements(allHoleElements).filter((ref) => ref >= 1 && ref <= 18));
+  console.log("[geometry-build] stage:fetchCourseFeatureElements golf_holes_refs", {
+    osm_id: osmId(course),
+    hole_refs_found: [...foundHoleRefs].sort((a, b) => a - b),
+  });
+
   for (let holeRef = 1; holeRef <= 18; holeRef += 1) {
-    const shouldContinue = await runFeatureQuery(
+    if (foundHoleRefs.has(holeRef)) continue;
+
+    const queryElements = await runFeatureQuery(
       `golf_hole_ref_${holeRef}`,
       `
         [out:json][timeout:90];
@@ -858,7 +876,7 @@ async function fetchCourseFeatureElements(course, { featureRadiusMeters }) {
         out geom;
       `,
     );
-    if (!shouldContinue) break;
+    if (queryElements === null || remainingBudgetMs() <= 0) break;
   }
 
   console.log("[geometry-build] stage:fetchCourseFeatureElements success", {
@@ -966,6 +984,17 @@ function nearestFeatures(features, userPoint, maxCount) {
     }))
     .sort((a, b) => a.distance_from_user_yards - b.distance_from_user_yards)
     .slice(0, maxCount);
+}
+
+function validHoleRefsFromElements(elements) {
+  return [
+    ...new Set(
+      (elements || [])
+        .filter((element) => element.tags?.golf === "hole" && getGeometry(element).length > 1)
+        .map((element) => numericRef(element.tags?.ref))
+        .filter(Number.isFinite),
+    ),
+  ];
 }
 
 function qualityNotes(geometry, options, primaryRoute, primaryGreen) {
