@@ -44,21 +44,30 @@ export async function getAiCaddyGeometry(input) {
   };
 
   const storedGeometry = parseStoredHoleGeometry(options.storedHoleGeometry);
-  if (!storedGeometry) {
-    return withLog(
-      missingResponse({ input: options }),
-      {
-        geometry_source: "none",
-        fallback_reason: "stored_hole_geometry_missing_or_invalid",
-      },
-    );
+  if (storedGeometry) {
+    const response = buildStoredAiCaddyResponse(storedGeometry, options);
+    return withLog(response, {
+      geometry_source: response.fallback_mode ? "fallback" : "stored_hole_geometry",
+      fallback_reason: response.fallback_mode ? "stored_hole_geometry_incomplete" : null,
+    });
   }
 
-  const response = buildStoredAiCaddyResponse(storedGeometry, options);
-  return withLog(response, {
-    geometry_source: response.fallback_mode ? "fallback" : "stored_hole_geometry",
-    fallback_reason: response.fallback_mode ? "stored_hole_geometry_incomplete" : null,
-  });
+  const cachedGeometry = cachedCourseGeometryForAiCaddy(options);
+  if (cachedGeometry) {
+    const response = buildAiCaddyResponse(cachedGeometry, options);
+    return withLog(response, {
+      geometry_source: response.fallback_mode ? "fallback" : "course_cache",
+      fallback_reason: response.fallback_mode ? "cached_course_geometry_incomplete" : null,
+    });
+  }
+
+  return withLog(
+    missingResponse({ input: options }),
+    {
+      geometry_source: "none",
+      fallback_reason: "stored_hole_geometry_missing_or_invalid",
+    },
+  );
 }
 
 export async function buildCourseGeometryForBubble(input) {
@@ -202,6 +211,57 @@ async function getCachedCourseGeometry(course, options) {
       status: "miss",
       key,
       expires_at: new Date(expiresAt).toISOString(),
+    },
+  };
+}
+
+function cachedCourseGeometryForAiCaddy(options) {
+  const explicitOsmId = parseOsmId(options.courseOsmId);
+  if (explicitOsmId) {
+    const cached = cachedCourseGeometryByKey(`course:${explicitOsmId.type}/${explicitOsmId.id}`);
+    if (cached) return cached;
+  }
+
+  const knownCourse = knownCourseForName(options.courseName);
+  if (knownCourse) {
+    const cached = cachedCourseGeometryByKey(`course:${knownCourse.osmType}/${knownCourse.osmId}`);
+    if (cached) return cached;
+  }
+
+  const wantedName = normalizeName(options.courseName);
+  if (!wantedName) return null;
+
+  for (const [key, cached] of courseCache.entries()) {
+    if (!cached || cached.expiresAt <= Date.now()) continue;
+
+    const courseName = normalizeName(cached.value?.course?.tags?.name);
+    if (!courseName) continue;
+
+    if (courseName === wantedName || courseName.includes(wantedName) || wantedName.includes(courseName)) {
+      return {
+        ...cached.value,
+        cache: {
+          status: "hit",
+          key,
+          expires_at: new Date(cached.expiresAt).toISOString(),
+        },
+      };
+    }
+  }
+
+  return null;
+}
+
+function cachedCourseGeometryByKey(key) {
+  const cached = courseCache.get(key);
+  if (!cached || cached.expiresAt <= Date.now()) return null;
+
+  return {
+    ...cached.value,
+    cache: {
+      status: "hit",
+      key,
+      expires_at: new Date(cached.expiresAt).toISOString(),
     },
   };
 }

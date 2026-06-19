@@ -133,7 +133,7 @@ app.listen(port, () => {
 
 function validateRequest(body) {
   const courseName = stringValue(body.course_name || body.courseName);
-  const courseOsmId = stringValue(body.course_osm_id || body.courseOsmId);
+  const courseOsmId = stringValue(body.osm_id || body.course_osm_id || body.courseOsmId);
   const hole = Number(body.hole || body.current_hole || body.currentHole);
   const lat = Number(body.lat || body.latitude);
   const lng = Number(body.lng || body.lon || body.longitude);
