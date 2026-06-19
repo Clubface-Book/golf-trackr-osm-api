@@ -799,15 +799,27 @@ async function fetchCourseFeatureElements(course, { featureRadiusMeters }) {
   });
 
   const elements = [];
+  const remainingBudgetMs = () => Math.max(0, OVERPASS_TIMEOUT_MS - (Date.now() - started));
   const runFeatureQuery = async (name, query) => {
+    const timeoutMs = remainingBudgetMs();
+    if (timeoutMs <= 0) {
+      console.log("[geometry-build] stage:fetchCourseFeatureElements query_skipped", {
+        query: name,
+        osm_id: osmId(course),
+        reason: "total_budget_exhausted",
+      });
+      return false;
+    }
+
     const queryStarted = Date.now();
     console.log("[geometry-build] stage:fetchCourseFeatureElements query_start", {
       query: name,
       osm_id: osmId(course),
+      remaining_budget_ms: timeoutMs,
     });
 
     try {
-      const data = await overpass(query, `${stage}:${name}`);
+      const data = await overpass(query, `${stage}:${name}`, timeoutMs);
       const queryElements = data.elements || [];
       elements.push(...queryElements);
       console.log("[geometry-build] stage:fetchCourseFeatureElements query_success", {
@@ -824,6 +836,8 @@ async function fetchCourseFeatureElements(course, { featureRadiusMeters }) {
         error: readableError(error),
       });
     }
+
+    return remainingBudgetMs() > 0;
   };
 
   await runFeatureQuery(
@@ -836,14 +850,15 @@ async function fetchCourseFeatureElements(course, { featureRadiusMeters }) {
   );
 
   for (let holeRef = 1; holeRef <= 18; holeRef += 1) {
-    await runFeatureQuery(
+    const shouldContinue = await runFeatureQuery(
       `golf_hole_ref_${holeRef}`,
       `
         [out:json][timeout:90];
-        nwr["golf"="hole"]["ref"="${holeRef}"](around:${featureRadiusMeters},${center.lat},${center.lng});
-        out body geom;
+        way["golf"="hole"]["ref"="${holeRef}"](around:${featureRadiusMeters},${center.lat},${center.lng});
+        out geom;
       `,
     );
+    if (!shouldContinue) break;
   }
 
   console.log("[geometry-build] stage:fetchCourseFeatureElements success", {
@@ -855,13 +870,13 @@ async function fetchCourseFeatureElements(course, { featureRadiusMeters }) {
   return elements;
 }
 
-async function overpass(query, stage = "overpass") {
+async function overpass(query, stage = "overpass", timeoutMs = OVERPASS_TIMEOUT_MS) {
   const controller = new AbortController();
   const started = Date.now();
-  const timeout = setTimeout(() => controller.abort(), OVERPASS_TIMEOUT_MS);
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
   console.log("[geometry-build] stage:overpass start", {
     stage,
-    timeout_ms: OVERPASS_TIMEOUT_MS,
+    timeout_ms: timeoutMs,
   });
 
   try {
@@ -898,13 +913,13 @@ async function overpass(query, stage = "overpass") {
     return data;
   } catch (error) {
     if (error.name === "AbortError") {
-      const timeoutError = new Error(`Overpass timed out after ${OVERPASS_TIMEOUT_MS}ms`);
+      const timeoutError = new Error(`Overpass timed out after ${timeoutMs}ms`);
       timeoutError.code = "overpass_timeout";
       timeoutError.stage = stage;
       console.log("[geometry-build] stage:overpass timeout", {
         stage,
         elapsed_ms: Date.now() - started,
-        timeout_ms: OVERPASS_TIMEOUT_MS,
+        timeout_ms: timeoutMs,
       });
       throw timeoutError;
     }
