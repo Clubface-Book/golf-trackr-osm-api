@@ -939,6 +939,15 @@ async function fetchCourseFeatureElements(course, { featureRadiusMeters }) {
     if (queryElements === null || remainingBudgetMs() <= 0) break;
   }
 
+  await runFeatureQuery(
+    "golf_extra_features",
+    `
+      [out:json][timeout:90];
+      nwr["golf"~"^(tee|bunker|fairway|water_hazard|lateral_water_hazard)$"](around:${featureRadiusMeters},${center.lat},${center.lng});
+      out body geom;
+    `,
+  );
+
   console.log("[geometry-build] stage:fetchCourseFeatureElements success", {
     osm_id: osmId(course),
     elapsed_ms: Date.now() - started,
