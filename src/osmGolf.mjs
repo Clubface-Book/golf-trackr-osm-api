@@ -5,6 +5,7 @@ const DEFAULT_CACHE_TTL_MS = Number(process.env.COURSE_CACHE_TTL_MS || 30 * 24 *
 const DEFAULT_SEARCH_RADIUS_METERS = Number(process.env.SEARCH_RADIUS_METERS || 5000);
 const DEFAULT_FEATURE_RADIUS_METERS = Number(process.env.FEATURE_RADIUS_METERS || 1200);
 const DEFAULT_HOLE_MATCH_METERS = Number(process.env.HOLE_MATCH_METERS || 100);
+const DEFAULT_BUILD_HOLE_MATCH_METERS = Number(process.env.BUILD_HOLE_MATCH_METERS || 300);
 const DEFAULT_MAX_HAZARDS = Number(process.env.MAX_HAZARDS || 3);
 const ATTRIBUTION = "© OpenStreetMap contributors, ODbL";
 
@@ -81,7 +82,7 @@ export async function buildCourseGeometryForBubble(input) {
     lng: input.lng,
     searchRadiusMeters: DEFAULT_SEARCH_RADIUS_METERS,
     featureRadiusMeters: DEFAULT_FEATURE_RADIUS_METERS,
-    holeMatchMeters: DEFAULT_HOLE_MATCH_METERS,
+    holeMatchMeters: DEFAULT_BUILD_HOLE_MATCH_METERS,
     maxHazards: DEFAULT_MAX_HAZARDS,
   };
 
