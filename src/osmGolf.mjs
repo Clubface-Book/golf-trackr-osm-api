@@ -911,34 +911,31 @@ async function fetchCourseFeatureElements(course, { featureRadiusMeters }) {
     `,
   );
 
-  const allHoleElements =
+  const frontNineHoleElements =
     (await runFeatureQuery(
-      "golf_holes",
+      "golf_holes_1_9",
       `
         [out:json][timeout:90];
-        way["golf"="hole"](around:${featureRadiusMeters},${center.lat},${center.lng});
+        way["golf"="hole"]["ref"~"^([1-9])$"](around:${featureRadiusMeters},${center.lat},${center.lng});
         out geom;
       `,
     )) || [];
-  const foundHoleRefs = new Set(validHoleRefsFromElements(allHoleElements).filter((ref) => ref >= 1 && ref <= 18));
+  const backNineHoleElements =
+    (await runFeatureQuery(
+      "golf_holes_10_18",
+      `
+        [out:json][timeout:90];
+        way["golf"="hole"]["ref"~"^(1[0-8])$"](around:${featureRadiusMeters},${center.lat},${center.lng});
+        out geom;
+      `,
+    )) || [];
+  const foundHoleRefs = new Set(
+    validHoleRefsFromElements([...frontNineHoleElements, ...backNineHoleElements]).filter((ref) => ref >= 1 && ref <= 18),
+  );
   console.log("[geometry-build] stage:fetchCourseFeatureElements golf_holes_refs", {
     osm_id: osmId(course),
     hole_refs_found: [...foundHoleRefs].sort((a, b) => a - b),
   });
-
-  for (let holeRef = 1; holeRef <= 18; holeRef += 1) {
-    if (foundHoleRefs.has(holeRef)) continue;
-
-    const queryElements = await runFeatureQuery(
-      `golf_hole_ref_${holeRef}`,
-      `
-        [out:json][timeout:90];
-        way["golf"="hole"]["ref"="${holeRef}"](around:${featureRadiusMeters},${center.lat},${center.lng});
-        out geom;
-      `,
-    );
-    if (queryElements === null || remainingBudgetMs() <= 0) break;
-  }
 
   await runFeatureQuery(
     "golf_extra_features",
