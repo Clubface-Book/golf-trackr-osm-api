@@ -609,14 +609,6 @@ function buildBubbleGeometryResponse({ input, geometry, attemptedAt }) {
       updatedAt: attemptedAt,
     }),
   );
-  const responseHoleRecords = holeRecords.map((hole) => ({
-    ...hole,
-    tees_json: stringifyJson(hole.tees_json),
-    bunkers_json: stringifyJson(hole.bunkers_json),
-    hazards_json: stringifyJson(hole.hazards_json),
-    fairway_json: stringifyJson(hole.fairway_json),
-    water_json: stringifyJson(hole.water_json),
-  }));
   const mappingStatus = classifyCourseGeometryStatus(holeRecords, geometry);
   const geometryAvailable = mappingStatus !== "missing";
   const builtAt = attemptedAt;
@@ -645,7 +637,7 @@ function buildBubbleGeometryResponse({ input, geometry, attemptedAt }) {
       last_build_attempt_at: attemptedAt,
       built_at: builtAt,
     },
-    course_hole_geometries: responseHoleRecords,
+    course_hole_geometries: holeRecords,
     attribution: ATTRIBUTION,
   };
 }
