@@ -9,6 +9,8 @@ const DEFAULT_HOLE_MATCH_METERS = Number(process.env.HOLE_MATCH_METERS || 100);
 const DEFAULT_BUILD_HOLE_MATCH_METERS = Number(process.env.BUILD_HOLE_MATCH_METERS || 300);
 const DEFAULT_MAX_HAZARDS = Number(process.env.MAX_HAZARDS || 3);
 const NOMINATIM_LOOKUP_DELAY_MS = Number(process.env.NOMINATIM_LOOKUP_DELAY_MS || 1000);
+const OVERPASS_RETRY_DELAYS_MS = [2000, 5000];
+const OVERPASS_RETRYABLE_STATUSES = new Set([429, 504]);
 const ATTRIBUTION = "© OpenStreetMap contributors, ODbL";
 
 const courseCache = new Map();
@@ -337,7 +339,8 @@ function cachedCourseGeometryByKey(key) {
 }
 
 async function buildCourseGeometry(course, options) {
-  const rawElements = await fetchCourseFeatureElements(course, options);
+  const featureResult = await fetchCourseFeatureElements(course, options);
+  const rawElements = featureResult.elements || [];
   const courseBoundary = getGeometry(course);
 
   const candidates = rawElements
@@ -398,6 +401,7 @@ async function buildCourseGeometry(course, options) {
     holeMap,
     holeRefsFound: [...holeMap.keys()].sort((a, b) => a - b),
     featureCounts: countBy(featuresInsideCourse, "kind"),
+    queryStatuses: featureResult.queryStatuses || {},
   };
 }
 
@@ -679,13 +683,16 @@ function buildBubbleGeometryResponse({ input, geometry, attemptedAt }) {
     }),
   );
   const mappingStatus = classifyCourseGeometryStatus(holeRecords, geometry);
+  const featureDetailStatus = classifyFeatureDetailStatus(geometry);
+  const buildStatus = mappingStatus === "partial" || hasFailedGeometryQuery(geometry) ? "partial" : "ready";
   const geometryAvailable = mappingStatus !== "missing";
   const builtAt = attemptedAt;
 
   return {
     ok: true,
-    build_status: "ready",
+    build_status: buildStatus,
     mapping_status: mappingStatus,
+    feature_detail_status: featureDetailStatus,
     geometry_available: geometryAvailable,
     course_key: input.courseKey,
     course_id: input.courseId || null,
@@ -694,13 +701,15 @@ function buildBubbleGeometryResponse({ input, geometry, attemptedAt }) {
       course_name: geometry.course.tags?.name || input.courseName || null,
       osm_id: osmId(geometry.course),
       mapping_status: mappingStatus,
-      build_status: "ready",
+      build_status: buildStatus,
+      feature_detail_status: featureDetailStatus,
       geometry_available: geometryAvailable,
       source: "osm",
       attribution: ATTRIBUTION,
       features_count_json: stringifyJson(geometry.featureCounts),
       hole_refs_found_json: stringifyJson(geometry.holeRefsFound),
-      quality_notes_json: stringifyJson(courseQualityNotes(mappingStatus, holeRecords)),
+      query_status_json: stringifyJson(geometry.queryStatuses || {}),
+      quality_notes_json: stringifyJson(courseQualityNotes(mappingStatus, holeRecords, geometry)),
       raw_course_json: stringifyJson(rawCourseForBubble(geometry)),
       build_error: "",
       last_build_attempt_at: attemptedAt,
@@ -716,6 +725,7 @@ function buildBubbleGeometryFallback({ input, attemptedAt, buildError }) {
     ok: true,
     build_status: "failed",
     mapping_status: "missing",
+    feature_detail_status: "missing",
     geometry_available: false,
     course_key: input.courseKey,
     course_id: input.courseId || null,
@@ -730,6 +740,8 @@ function buildBubbleGeometryFallback({ input, attemptedAt, buildError }) {
       attribution: ATTRIBUTION,
       features_count_json: "{}",
       hole_refs_found_json: "[]",
+      query_status_json: "{}",
+      feature_detail_status: "missing",
       quality_notes_json: stringifyJson(["OSM geometry unavailable. Yardage-only fallback should be used."]),
       raw_course_json: "{}",
       build_error: buildError || "osm_geometry_unavailable",
@@ -752,12 +764,14 @@ function buildBubbleHoleGeometryRecord({ geometry, holeNumber, updatedAt }) {
   const waterHazards = features.filter((feature) => isWaterKind(feature.kind));
   const fairways = features.filter((feature) => feature.kind === "fairway");
   const primaryGreen = pickPrimaryGreen(greens, primaryRoute);
-  const geometryStatus = classifyHoleGeometryStatus({
+  const routeGreenStatus = classifyHoleGeometryStatus({
     holeRecord,
     primaryRoute,
     primaryGreen,
     features,
   });
+  const geometryStatus =
+    routeGreenStatus === "full" && geometryQueryFailed(geometry, "golf_extra_features") ? "partial" : routeGreenStatus;
   const green = primaryGreen ? bubbleFeature(primaryGreen) : null;
   const route = primaryRoute ? bubbleRoute(primaryRoute) : null;
   const teeRecords = tees.map((feature) => bubbleFeature(feature));
@@ -801,6 +815,7 @@ function classifyCourseGeometryStatus(holeRecords, geometry) {
     .reduce((total, [, count]) => total + count, 0);
 
   if (!usefulFeatureCount || !holeRecords.length) return "missing";
+  if (hasFailedGeometryQuery(geometry)) return "partial";
 
   const fullHoles = new Set(
     holeRecords.filter((record) => record.geometry_status === "full").map((record) => record.hole_number),
@@ -813,22 +828,46 @@ function classifyCourseGeometryStatus(holeRecords, geometry) {
   return "missing";
 }
 
+function classifyFeatureDetailStatus(geometry) {
+  const status = geometry.queryStatuses?.golf_extra_features?.status;
+  if (status === "success") return "ready";
+  if (status === "failed" || status === "skipped") return "failed";
+  return "unknown";
+}
+
+function hasFailedGeometryQuery(geometry) {
+  return Object.values(geometry.queryStatuses || {}).some((status) => status.status === "failed" || status.status === "skipped");
+}
+
+function geometryQueryFailed(geometry, queryName) {
+  const status = geometry.queryStatuses?.[queryName]?.status;
+  return status === "failed" || status === "skipped";
+}
+
 function classifyHoleGeometryStatus({ holeRecord, primaryRoute, primaryGreen, features }) {
   if (primaryRoute && primaryGreen) return "full";
   if (holeRecord && (primaryRoute || primaryGreen || features.length > 0)) return "partial";
   return "missing";
 }
 
-function courseQualityNotes(mappingStatus, holeRecords) {
+function courseQualityNotes(mappingStatus, holeRecords, geometry) {
+  const notes = [];
+
   if (mappingStatus === "full") {
-    return ["Course geometry built from OSM.", "All primary hole geometry found for a complete 9 or 18 hole set."];
+    notes.push("Course geometry built from OSM.", "All primary hole geometry found for a complete 9 or 18 hole set.");
+  } else if (mappingStatus === "partial") {
+    notes.push("Course geometry built from OSM.", "Some hole geometry is incomplete.");
+  } else {
+    notes.push("Course found in OSM, but no usable hole-level geometry was found.");
   }
 
-  if (mappingStatus === "partial") {
-    return ["Course geometry built from OSM.", "Some hole geometry is incomplete."];
+  if (geometryQueryFailed(geometry, "golf_extra_features")) {
+    notes.push(
+      "Routes and greens were found where available, but tees, bunkers, water, fairways, and hazards may be incomplete because the golf_extra_features Overpass query failed.",
+    );
   }
 
-  return ["Course found in OSM, but no usable hole-level geometry was found."];
+  return notes;
 }
 
 function rawCourseForBubble(geometry) {
@@ -1097,6 +1136,7 @@ async function fetchCourseFeatureElements(course, { featureRadiusMeters }) {
   const stage = "fetchCourseFeatureElements";
   const started = Date.now();
   const center = courseCenter(course);
+  const queryStatuses = {};
   console.log("[geometry-build] stage:fetchCourseFeatureElements start", {
     osm_id: osmId(course),
     center,
@@ -1106,43 +1146,99 @@ async function fetchCourseFeatureElements(course, { featureRadiusMeters }) {
   const elements = [];
   const remainingBudgetMs = () => Math.max(0, OVERPASS_TIMEOUT_MS - (Date.now() - started));
   const runFeatureQuery = async (name, query) => {
-    const timeoutMs = remainingBudgetMs();
-    if (timeoutMs <= 0) {
-      console.log("[geometry-build] stage:fetchCourseFeatureElements query_skipped", {
-        query: name,
-        osm_id: osmId(course),
-        reason: "total_budget_exhausted",
-      });
-      return null;
-    }
-
     const queryStarted = Date.now();
-    console.log("[geometry-build] stage:fetchCourseFeatureElements query_start", {
-      query: name,
-      osm_id: osmId(course),
-      remaining_budget_ms: timeoutMs,
-    });
+    queryStatuses[name] = {
+      status: "pending",
+      attempts: 0,
+      elements: 0,
+      error: "",
+      http_status: null,
+    };
 
-    try {
-      const data = await overpass(query, `${stage}:${name}`, timeoutMs);
-      const queryElements = data.elements || [];
-      elements.push(...queryElements);
-      console.log("[geometry-build] stage:fetchCourseFeatureElements query_success", {
+    for (let attempt = 1; attempt <= OVERPASS_RETRY_DELAYS_MS.length + 1; attempt += 1) {
+      const timeoutMs = remainingBudgetMs();
+      if (timeoutMs <= 0) {
+        queryStatuses[name] = {
+          ...queryStatuses[name],
+          status: attempt === 1 ? "skipped" : "failed",
+          attempts: attempt - 1,
+          error: "total_budget_exhausted",
+          elapsed_ms: Date.now() - queryStarted,
+        };
+        console.log("[geometry-build] stage:fetchCourseFeatureElements query_skipped", {
+          query: name,
+          osm_id: osmId(course),
+          reason: "total_budget_exhausted",
+        });
+        return [];
+      }
+
+      queryStatuses[name].attempts = attempt;
+      console.log("[geometry-build] stage:fetchCourseFeatureElements query_start", {
         query: name,
         osm_id: osmId(course),
-        elapsed_ms: Date.now() - queryStarted,
-        elements: queryElements.length,
+        attempt,
+        remaining_budget_ms: timeoutMs,
       });
-      return queryElements;
-    } catch (error) {
-      console.log("[geometry-build] stage:fetchCourseFeatureElements query_failed", {
-        query: name,
-        osm_id: osmId(course),
-        elapsed_ms: Date.now() - queryStarted,
-        error: readableError(error),
-      });
+
+      try {
+        const data = await overpass(query, `${stage}:${name}`, timeoutMs);
+        const queryElements = data.elements || [];
+        elements.push(...queryElements);
+        queryStatuses[name] = {
+          ...queryStatuses[name],
+          status: "success",
+          attempts: attempt,
+          elements: queryElements.length,
+          error: "",
+          http_status: null,
+          elapsed_ms: Date.now() - queryStarted,
+        };
+        console.log("[geometry-build] stage:fetchCourseFeatureElements query_success", {
+          query: name,
+          osm_id: osmId(course),
+          attempt,
+          elapsed_ms: Date.now() - queryStarted,
+          elements: queryElements.length,
+        });
+        return queryElements;
+      } catch (error) {
+        const retryDelayMs = retryDelayForOverpassError(error, attempt);
+        const canRetry = retryDelayMs > 0 && remainingBudgetMs() > retryDelayMs;
+        console.log("[geometry-build] stage:fetchCourseFeatureElements query_failed", {
+          query: name,
+          osm_id: osmId(course),
+          attempt,
+          retrying: canRetry,
+          retry_delay_ms: canRetry ? retryDelayMs : 0,
+          elapsed_ms: Date.now() - queryStarted,
+          error: readableError(error),
+        });
+
+        if (canRetry) {
+          await delay(retryDelayMs);
+          continue;
+        }
+
+        queryStatuses[name] = {
+          ...queryStatuses[name],
+          status: "failed",
+          attempts: attempt,
+          elements: 0,
+          error: readableError(error),
+          http_status: error.status || null,
+          elapsed_ms: Date.now() - queryStarted,
+        };
+        return [];
+      }
     }
 
+    queryStatuses[name] = {
+      ...queryStatuses[name],
+      status: "failed",
+      error: "retry_attempts_exhausted",
+      elapsed_ms: Date.now() - queryStarted,
+    };
     return [];
   };
 
@@ -1155,27 +1251,16 @@ async function fetchCourseFeatureElements(course, { featureRadiusMeters }) {
     `,
   );
 
-  const frontNineHoleElements =
+  const holeElements =
     (await runFeatureQuery(
-      "golf_holes_1_9",
+      "golf_holes_1_18",
       `
         [out:json][timeout:90];
-        way["golf"="hole"]["ref"~"^([1-9])$"](around:${featureRadiusMeters},${center.lat},${center.lng});
+        way["golf"="hole"]["ref"~"^([1-9]|1[0-8])$"](around:${featureRadiusMeters},${center.lat},${center.lng});
         out geom;
       `,
     )) || [];
-  const backNineHoleElements =
-    (await runFeatureQuery(
-      "golf_holes_10_18",
-      `
-        [out:json][timeout:90];
-        way["golf"="hole"]["ref"~"^(1[0-8])$"](around:${featureRadiusMeters},${center.lat},${center.lng});
-        out geom;
-      `,
-    )) || [];
-  const foundHoleRefs = new Set(
-    validHoleRefsFromElements([...frontNineHoleElements, ...backNineHoleElements]).filter((ref) => ref >= 1 && ref <= 18),
-  );
+  const foundHoleRefs = new Set(validHoleRefsFromElements(holeElements).filter((ref) => ref >= 1 && ref <= 18));
   console.log("[geometry-build] stage:fetchCourseFeatureElements golf_holes_refs", {
     osm_id: osmId(course),
     hole_refs_found: [...foundHoleRefs].sort((a, b) => a - b),
@@ -1194,9 +1279,15 @@ async function fetchCourseFeatureElements(course, { featureRadiusMeters }) {
     osm_id: osmId(course),
     elapsed_ms: Date.now() - started,
     elements: elements.length,
+    query_statuses: queryStatuses,
   });
 
-  return elements;
+  return { elements, queryStatuses };
+}
+
+function retryDelayForOverpassError(error, attempt) {
+  if (!OVERPASS_RETRYABLE_STATUSES.has(error.status)) return 0;
+  return OVERPASS_RETRY_DELAYS_MS[attempt - 1] || 0;
 }
 
 async function overpass(query, stage = "overpass", timeoutMs = OVERPASS_TIMEOUT_MS) {
@@ -1322,6 +1413,12 @@ function qualityNotes(geometry, options, primaryRoute, primaryGreen) {
 
   if (!primaryGreen) {
     notes.push("No OSM green found for this hole.");
+  }
+
+  if (geometryQueryFailed(geometry, "golf_extra_features")) {
+    notes.push(
+      "Tees, bunkers, water, fairways, and hazards may be incomplete because the golf_extra_features Overpass query failed.",
+    );
   }
 
   if (!notes.length) {
