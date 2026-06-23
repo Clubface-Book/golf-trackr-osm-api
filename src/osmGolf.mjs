@@ -1,4 +1,5 @@
 const OVERPASS_URL = process.env.OVERPASS_URL || "https://overpass-api.de/api/interpreter";
+const NOMINATIM_SEARCH_URL = process.env.NOMINATIM_SEARCH_URL || "https://nominatim.openstreetmap.org/search";
 const OVERPASS_TIMEOUT_MS = Number(process.env.OVERPASS_TIMEOUT_MS || 120000);
 const YARDS_PER_METER = 1.0936132983377078;
 const DEFAULT_CACHE_TTL_MS = Number(process.env.COURSE_CACHE_TTL_MS || 30 * 24 * 60 * 60 * 1000);
@@ -7,6 +8,7 @@ const DEFAULT_FEATURE_RADIUS_METERS = Number(process.env.FEATURE_RADIUS_METERS |
 const DEFAULT_HOLE_MATCH_METERS = Number(process.env.HOLE_MATCH_METERS || 100);
 const DEFAULT_BUILD_HOLE_MATCH_METERS = Number(process.env.BUILD_HOLE_MATCH_METERS || 300);
 const DEFAULT_MAX_HAZARDS = Number(process.env.MAX_HAZARDS || 3);
+const NOMINATIM_LOOKUP_DELAY_MS = Number(process.env.NOMINATIM_LOOKUP_DELAY_MS || 1000);
 const ATTRIBUTION = "© OpenStreetMap contributors, ODbL";
 
 const courseCache = new Map();
@@ -69,6 +71,73 @@ export async function getAiCaddyGeometry(input) {
       fallback_reason: "stored_hole_geometry_missing_or_invalid",
     },
   );
+}
+
+export async function lookupCourseOsmForBubble(input) {
+  const queryVariants = osmLookupQueryVariants(input);
+  const matchesByOsmId = new Map();
+  const queryErrors = [];
+
+  for (let index = 0; index < queryVariants.length; index += 1) {
+    const query = queryVariants[index];
+    if (index > 0 && NOMINATIM_LOOKUP_DELAY_MS > 0) {
+      await delay(NOMINATIM_LOOKUP_DELAY_MS);
+    }
+
+    try {
+      const results = await searchNominatim(query);
+      for (const result of results) {
+        const scored = scoreNominatimCourseResult(result, input, query);
+        const key = scored.osm_id || `${scored.osm_type}/${scored.osm_numeric_id}`;
+        const existing = matchesByOsmId.get(key);
+        if (!existing || scored.score > existing.score) {
+          matchesByOsmId.set(key, scored);
+        }
+      }
+    } catch (error) {
+      queryErrors.push({
+        query,
+        error: readableError(error),
+      });
+    }
+
+    const bestSoFar = bestLookupMatch([...matchesByOsmId.values()]);
+    if (bestSoFar?.confidence === "high") break;
+  }
+
+  const possibleMatches = [...matchesByOsmId.values()].sort((a, b) => b.score - a.score);
+  const best = bestLookupMatch(possibleMatches);
+  const found = Boolean(best && best.confidence !== "low");
+
+  if (!found) {
+    return {
+      found: false,
+      osm_id: null,
+      osm_type: null,
+      osm_numeric_id: null,
+      name: "",
+      display_name: "",
+      lat: null,
+      lng: null,
+      class: "",
+      type: "",
+      confidence: "low",
+      reason: queryErrors.length
+        ? "No confident OSM golf course match found. Some lookup queries failed."
+        : "No confident OSM golf course match found.",
+      query_used: "",
+      possible_matches: possibleMatches.slice(0, 5).map(publicLookupMatch),
+    };
+  }
+
+  return {
+    found: true,
+    ...publicLookupMatch(best),
+    possible_matches: possibleMatches
+      .filter((match) => match.osm_id !== best.osm_id)
+      .slice(0, 5)
+      .map(publicLookupMatch),
+  };
 }
 
 export async function buildCourseGeometryForBubble(input) {
@@ -791,6 +860,176 @@ function bubbleFeature(feature) {
 
 function stringifyJson(value) {
   return JSON.stringify(value);
+}
+
+function osmLookupQueryVariants({ courseName, clubName, town, city, country }) {
+  const variants = [
+    [courseName, town, country],
+    [clubName, town, country],
+    [courseName, city, country],
+    [clubName, city, country],
+    [courseName, country],
+    [clubName, country],
+  ];
+  const seen = new Set();
+
+  return variants
+    .map((parts) => parts.filter(Boolean).join(" ").replace(/\s+/g, " ").trim())
+    .filter((query) => {
+      const key = normalizeLookupText(query);
+      if (!key || seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+}
+
+async function searchNominatim(query) {
+  const url = new URL(NOMINATIM_SEARCH_URL);
+  url.searchParams.set("format", "json");
+  url.searchParams.set("q", query);
+  url.searchParams.set("limit", "5");
+  url.searchParams.set("addressdetails", "1");
+  url.searchParams.set("extratags", "1");
+
+  const response = await fetch(url, {
+    headers: {
+      accept: "application/json",
+      "user-agent": "Golf Trackr OSM Geometry API course lookup",
+    },
+  });
+
+  if (!response.ok) {
+    const error = new Error(`Nominatim lookup failed with HTTP ${response.status}`);
+    error.status = response.status;
+    throw error;
+  }
+
+  const data = await response.json();
+  return Array.isArray(data) ? data : [];
+}
+
+function scoreNominatimCourseResult(result, input, queryUsed) {
+  const osmType = String(result.osm_type || "").toLowerCase();
+  const osmNumericId = String(result.osm_id || "");
+  const className = String(result.class || "");
+  const type = String(result.type || "");
+  const name = String(result.name || "");
+  const displayName = String(result.display_name || "");
+  const searchableText = normalizeLookupText(`${name} ${displayName}`);
+  const isGolfCourse = className === "leisure" && type === "golf_course";
+  const isBuilding = className === "building" || result.addresstype === "building";
+  const isGolfRelated = searchableText.includes("golf") || className === "leisure" || type.includes("golf");
+  const nameScore = lookupNameScore(result, input);
+  const locationScore = lookupLocationScore(result, input);
+  const osmTypeScore = osmType === "way" || osmType === "relation" ? 40 : 0;
+  const kindScore = isGolfCourse ? 1000 : isGolfRelated && !isBuilding ? 500 : 0;
+  const buildingPenalty = isBuilding ? 250 : 0;
+  const score = kindScore + nameScore + locationScore + osmTypeScore - buildingPenalty;
+  const confidence = lookupConfidence({ isGolfCourse, isGolfRelated, isBuilding, nameScore, locationScore });
+  const reason =
+    confidence === "high"
+      ? "Matched an OSM leisure/golf_course result by name and location."
+      : confidence === "medium"
+        ? "Matched a golf-related result, but it is not a clear high-confidence golf course match."
+        : isBuilding
+          ? "Result appears to be a building or clubhouse rather than the golf course."
+          : "Result is not a confident golf course match.";
+
+  return {
+    osm_id: osmType && osmNumericId ? `${osmType}/${osmNumericId}` : null,
+    osm_type: osmType || null,
+    osm_numeric_id: osmNumericId || null,
+    name,
+    display_name: displayName,
+    lat: finiteNumber(result.lat),
+    lng: finiteNumber(result.lon),
+    class: className,
+    type,
+    confidence,
+    reason,
+    query_used: queryUsed,
+    score,
+  };
+}
+
+function lookupNameScore(result, { courseName, clubName }) {
+  const candidate = normalizeLookupText(result.name || result.display_name || "");
+  const wantedNames = [courseName, clubName].map(normalizeLookupText).filter(Boolean);
+  let best = 0;
+
+  for (const wanted of wantedNames) {
+    if (candidate === wanted) best = Math.max(best, 320);
+    else if (candidate.includes(wanted) || wanted.includes(candidate)) best = Math.max(best, 220);
+    else best = Math.max(best, Math.round(180 * tokenOverlap(candidate, wanted)));
+  }
+
+  return best;
+}
+
+function lookupLocationScore(result, { town, city, country }) {
+  const text = normalizeLookupText(`${result.display_name || ""} ${JSON.stringify(result.address || {})}`);
+  const locations = [town, city, country].map(normalizeLookupText).filter(Boolean);
+  return locations.reduce((score, value) => score + (text.includes(value) ? 80 : 0), 0);
+}
+
+function lookupConfidence({ isGolfCourse, isGolfRelated, isBuilding, nameScore, locationScore }) {
+  if (isGolfCourse && nameScore >= 120 && locationScore >= 80) return "high";
+  if (isGolfCourse && nameScore >= 80) return "medium";
+  if (isGolfRelated && !isBuilding && nameScore >= 80) return "medium";
+  return "low";
+}
+
+function bestLookupMatch(matches) {
+  return matches
+    .filter((match) => match.osm_id)
+    .sort((a, b) => b.score - a.score)[0] || null;
+}
+
+function publicLookupMatch(match) {
+  return {
+    osm_id: match.osm_id,
+    osm_type: match.osm_type,
+    osm_numeric_id: match.osm_numeric_id,
+    name: match.name,
+    display_name: match.display_name,
+    lat: match.lat,
+    lng: match.lng,
+    class: match.class,
+    type: match.type,
+    confidence: match.confidence,
+    reason: match.reason,
+    query_used: match.query_used,
+  };
+}
+
+function normalizeLookupText(value) {
+  return String(value || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/&/g, "and")
+    .replace(/[^a-z0-9]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function tokenOverlap(a, b) {
+  const aTokens = new Set(a.split(" ").filter(Boolean));
+  const bTokens = new Set(b.split(" ").filter(Boolean));
+  if (!aTokens.size || !bTokens.size) return 0;
+
+  let shared = 0;
+  for (const token of aTokens) {
+    if (bTokens.has(token)) shared += 1;
+  }
+
+  return shared / Math.max(aTokens.size, bTokens.size);
+}
+
+function delay(ms) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
 }
 
 async function fetchCourseByOsmId({ type, id }) {

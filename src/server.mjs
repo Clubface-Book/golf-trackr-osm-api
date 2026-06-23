@@ -1,6 +1,6 @@
 import "dotenv/config";
 import express from "express";
-import { buildCourseGeometryForBubble, getAiCaddyGeometry } from "./osmGolf.mjs";
+import { buildCourseGeometryForBubble, getAiCaddyGeometry, lookupCourseOsmForBubble } from "./osmGolf.mjs";
 
 const app = express();
 const port = Number(process.env.PORT || 3000);
@@ -42,6 +42,46 @@ app.use((req, res, next) => {
 
 app.get("/health", (req, res) => {
   res.json({ ok: true, service: "golf-trackr-osm-geometry-api" });
+});
+
+app.post("/v1/courses/osm/lookup", async (req, res) => {
+  try {
+    const input = validateOsmLookupRequest(req.body || {});
+    console.log("[osm-lookup] incoming", {
+      course_name: input.courseName || null,
+      club_name: input.clubName || null,
+      town: input.town || null,
+      city: input.city || null,
+      country: input.country || null,
+    });
+
+    const result = await lookupCourseOsmForBubble(input);
+
+    console.log("[osm-lookup] completed", {
+      found: result.found,
+      osm_id: result.osm_id || null,
+      confidence: result.confidence,
+      query_used: result.query_used || null,
+    });
+
+    res.status(200).json(result);
+  } catch (error) {
+    if (error.statusCode) {
+      res.status(error.statusCode).json({
+        ok: false,
+        error: error.code || "bad_request",
+        message: error.message,
+      });
+      return;
+    }
+
+    console.error(error);
+    res.status(500).json({
+      ok: false,
+      error: "server_error",
+      message: "The OSM course lookup API could not complete this request.",
+    });
+  }
 });
 
 app.post("/v1/courses/geometry/build", async (req, res) => {
@@ -163,6 +203,30 @@ function validateRequest(body) {
     selectedTeeName: stringValue(body.selected_tee_name || body.selectedTeeName),
     currentYardage: nullableNumber(body.current_yardage || body.currentYardage),
     storedHoleGeometry: body.stored_hole_geometry || body.storedHoleGeometry || body.course_hole_geometry || null,
+  };
+}
+
+function validateOsmLookupRequest(body) {
+  const courseName = stringValue(body.course_name || body.courseName);
+  const clubName = stringValue(body.club_name || body.clubName);
+  const town = stringValue(body.town);
+  const city = stringValue(body.city);
+  const country = stringValue(body.country);
+
+  if (!courseName && !clubName) {
+    throw requestError("course_name or club_name is required.", "missing_course_name");
+  }
+
+  if (!country) {
+    throw requestError("country is required.", "missing_country");
+  }
+
+  return {
+    courseName,
+    clubName,
+    town,
+    city,
+    country,
   };
 }
 
