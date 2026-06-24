@@ -522,6 +522,13 @@ function buildStoredAiCaddyResponse(storedGeometry, options) {
   }
 
   const route = parseJsonValue(storedGeometry.route_json || storedGeometry.routeJson || storedGeometry.route) || {};
+  const routeCoordinates = Array.isArray(route.coordinates)
+    ? route.coordinates
+        .map((point) => [finiteNumber(point.lng), finiteNumber(point.lat)])
+        .filter(([lng, lat]) => Number.isFinite(lng) && Number.isFinite(lat))
+    : [];
+  const teePoint = routeCoordinates[0] || null;
+  const greenPoint = [green.center.lng, green.center.lat];
   const bunkers = storedFeatures(storedGeometry.bunkers_json || storedGeometry.bunkersJson || storedGeometry.bunkers, "bunker");
   const waterHazards = storedFeatures(
     storedGeometry.water_json || storedGeometry.waterJson || storedGeometry.water_hazards || storedGeometry.waterHazards,
@@ -531,18 +538,205 @@ function buildStoredAiCaddyResponse(storedGeometry, options) {
     storedGeometry.hazards_json || storedGeometry.hazardsJson || storedGeometry.hazards,
     "hazard",
   );
-  const nearestBunkers = nearestStoredFeatures(
-    bunkers.length ? bunkers : hazardFallback.filter((feature) => feature.type === "bunker"),
-    userPoint,
-    options.maxHazards,
-  );
-  const nearestWaterHazards = nearestStoredFeatures(
-    waterHazards.length ? waterHazards : hazardFallback.filter((feature) => feature.type !== "bunker"),
-    userPoint,
-    options.maxHazards,
-  );
+  const bunkerFeatures = bunkers.length ? bunkers : hazardFallback.filter((feature) => feature.type === "bunker");
+  const waterHazardFeatures = waterHazards.length
+    ? waterHazards
+    : hazardFallback.filter((feature) => feature.type !== "bunker");
+  const nearestBunkers = nearestStoredFeatures(bunkerFeatures, userPoint, options.maxHazards);
+  const nearestWaterHazards = nearestStoredFeatures(waterHazardFeatures, userPoint, options.maxHazards);
   const geometryStatus = normalizeGeometryStatus(storedGeometry.geometry_status || storedGeometry.geometryStatus);
   const mappingStatus = geometryStatus === "partial" ? "partial" : "full";
+
+  const routeLengthMeters = routeCoordinates.reduce((total, point, index) => {
+    if (index === 0) return total;
+    return total + distanceMeters(routeCoordinates[index - 1], point);
+  }, 0);
+
+  const routeProjection = (point) => {
+    if (routeCoordinates.length < 2) return null;
+
+    let best = null;
+    let cumulativeMeters = 0;
+
+    for (let index = 1; index < routeCoordinates.length; index += 1) {
+      const start = routeCoordinates[index - 1];
+      const end = routeCoordinates[index];
+      const segmentMeters = distanceMeters(start, end);
+      const [px, py] = project(point);
+      const [sx, sy] = project(start);
+      const [ex, ey] = project(end);
+      const dx = ex - sx;
+      const dy = ey - sy;
+
+      if (dx === 0 && dy === 0) continue;
+
+      const t = Math.max(0, Math.min(1, ((px - sx) * dx + (py - sy) * dy) / (dx * dx + dy * dy)));
+      const projectedX = sx + t * dx;
+      const projectedY = sy + t * dy;
+      const offsetMeters = Math.hypot(px - projectedX, py - projectedY);
+      const cross = dx * (py - sy) - dy * (px - sx);
+      const side = Math.abs(cross) < 1e-6 ? "on_route" : cross > 0 ? "left" : "right";
+
+      if (!best || offsetMeters < best.offsetMeters) {
+        best = {
+          alongMeters: cumulativeMeters + segmentMeters * t,
+          offsetMeters,
+          side,
+        };
+      }
+
+      cumulativeMeters += segmentMeters;
+    }
+
+    return best;
+  };
+
+  const bearingDegrees = (from, to) => {
+    const radians = Math.PI / 180;
+    const lat1 = from[1] * radians;
+    const lat2 = to[1] * radians;
+    const deltaLng = (to[0] - from[0]) * radians;
+    const y = Math.sin(deltaLng) * Math.cos(lat2);
+    const x = Math.cos(lat1) * Math.sin(lat2) - Math.sin(lat1) * Math.cos(lat2) * Math.cos(deltaLng);
+    return Math.round(((Math.atan2(y, x) * 180) / Math.PI + 360) % 360);
+  };
+
+  const compassLabel = (degrees) => {
+    const labels = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"];
+    return labels[Math.round(degrees / 45) % labels.length];
+  };
+
+  const playerProjection = routeProjection(userPoint);
+  const playerProgressAlongHole =
+    playerProjection && routeLengthMeters > 0
+      ? {
+          available: true,
+          distance_from_tee_yards: Math.round(playerProjection.alongMeters * YARDS_PER_METER),
+          distance_to_green_yards: yardsBetween(userPoint, greenPoint),
+          distance_from_route_yards: Math.round(playerProjection.offsetMeters * YARDS_PER_METER),
+          percent_complete: Math.max(0, Math.min(100, Math.round((playerProjection.alongMeters / routeLengthMeters) * 100))),
+        }
+      : {
+          available: false,
+          reason: "route_geometry_unavailable",
+        };
+
+  const teeToGreenBearing =
+    teePoint && greenPoint
+      ? (() => {
+          const degrees = bearingDegrees(teePoint, greenPoint);
+          return {
+            available: true,
+            degrees,
+            compass: compassLabel(degrees),
+          };
+        })()
+      : {
+          available: false,
+          reason: "route_geometry_unavailable",
+        };
+
+  const enrichHazard = (feature) => {
+    const centerPoint = [feature.center.lng, feature.center.lat];
+    const projection = routeProjection(centerPoint);
+    const teeToHazardYards = projection
+      ? Math.round(projection.alongMeters * YARDS_PER_METER)
+      : teePoint
+        ? yardsBetween(teePoint, centerPoint)
+        : null;
+    const routeOffsetYards = projection ? Math.round(projection.offsetMeters * YARDS_PER_METER) : null;
+    const positionAlongHolePercent =
+      projection && routeLengthMeters > 0
+        ? Math.max(0, Math.min(100, Math.round((projection.alongMeters / routeLengthMeters) * 100)))
+        : null;
+
+    return {
+      type: outputHazardType(feature.type),
+      osm_id: feature.osm_id,
+      center: feature.center,
+      distance_from_user_yards: yardsBetween(userPoint, centerPoint),
+      tee_to_hazard_yards: teeToHazardYards,
+      green_to_hazard_yards: yardsBetween(centerPoint, greenPoint),
+      side_of_route: projection?.side || "unknown",
+      route_offset_yards: routeOffsetYards,
+      position_along_hole_percent: positionAlongHolePercent,
+      match: feature.match || null,
+      _along_meters: projection?.alongMeters ?? null,
+    };
+  };
+
+  const publicHazard = ({ _along_meters, ...hazard }) => hazard;
+  const maxStrategicHazards = options.maxHazards || DEFAULT_MAX_HAZARDS;
+  const strategicBunkers = bunkerFeatures.map(enrichHazard);
+  const strategicWaterHazards = waterHazardFeatures.map(enrichHazard);
+  const strategicHazards = [...strategicBunkers, ...strategicWaterHazards];
+
+  const greensideBunkers = strategicBunkers
+    .filter((hazard) => hazard.green_to_hazard_yards <= 60)
+    .sort((a, b) => a.green_to_hazard_yards - b.green_to_hazard_yards)
+    .slice(0, maxStrategicHazards)
+    .map(publicHazard);
+
+  const leftSideBunkers = strategicBunkers
+    .filter((hazard) => hazard.side_of_route === "left" && (hazard.route_offset_yards ?? Infinity) <= 100)
+    .sort((a, b) => a.tee_to_hazard_yards - b.tee_to_hazard_yards)
+    .slice(0, maxStrategicHazards)
+    .map(publicHazard);
+
+  const rightSideBunkers = strategicBunkers
+    .filter((hazard) => hazard.side_of_route === "right" && (hazard.route_offset_yards ?? Infinity) <= 100)
+    .sort((a, b) => a.tee_to_hazard_yards - b.tee_to_hazard_yards)
+    .slice(0, maxStrategicHazards)
+    .map(publicHazard);
+
+  const teeShotRelevantHazards = strategicHazards
+    .filter(
+      (hazard) =>
+        (hazard.tee_to_hazard_yards ?? 0) >= 140 &&
+        (hazard.tee_to_hazard_yards ?? Infinity) <= 300 &&
+        (hazard.route_offset_yards ?? Infinity) <= 100,
+    )
+    .sort((a, b) => a.tee_to_hazard_yards - b.tee_to_hazard_yards)
+    .slice(0, maxStrategicHazards)
+    .map(publicHazard);
+
+  const approachRelevantHazards = strategicHazards
+    .filter((hazard) => {
+      const nearGreen = hazard.green_to_hazard_yards <= 100;
+      const aheadOfPlayer = playerProjection && hazard._along_meters !== null && hazard._along_meters >= playerProjection.alongMeters;
+      const nearApproachRoute =
+        aheadOfPlayer && (hazard.position_along_hole_percent ?? 0) >= 65 && (hazard.route_offset_yards ?? Infinity) <= 100;
+      return nearGreen || nearApproachRoute;
+    })
+    .sort((a, b) => a.green_to_hazard_yards - b.green_to_hazard_yards)
+    .slice(0, maxStrategicHazards)
+    .map(publicHazard);
+
+  const strategicSummary = [];
+  if (playerProgressAlongHole.available) {
+    strategicSummary.push(
+      `Player is approximately ${playerProgressAlongHole.distance_from_tee_yards} yards from the tee along the stored hole route and ${playerProgressAlongHole.distance_to_green_yards} yards from the green.`,
+    );
+  }
+  if (teeToGreenBearing.available) {
+    strategicSummary.push(`Hole appears to play roughly ${teeToGreenBearing.compass} from tee to green.`);
+  }
+  if (greensideBunkers.length) {
+    strategicSummary.push(
+      `${greensideBunkers.length} greenside bunker(s) appear within approximately 60 yards of the green, based on stored centre-point geometry.`,
+    );
+  }
+  if (leftSideBunkers.length || rightSideBunkers.length) {
+    strategicSummary.push(
+      `${leftSideBunkers.length} left-side and ${rightSideBunkers.length} right-side bunker(s) appear near the stored hole route.`,
+    );
+  }
+  if (teeShotRelevantHazards.length) {
+    strategicSummary.push(`${teeShotRelevantHazards.length} hazard(s) likely relate to the tee-shot landing area.`);
+  }
+  if (approachRelevantHazards.length) {
+    strategicSummary.push(`${approachRelevantHazards.length} hazard(s) likely relate to the approach or green complex.`);
+  }
 
   return {
     ok: true,
@@ -566,6 +760,14 @@ function buildStoredAiCaddyResponse(storedGeometry, options) {
     nearest_bunkers: nearestBunkers,
     nearest_water_hazards: nearestWaterHazards,
     route,
+    player_progress_along_hole: playerProgressAlongHole,
+    tee_to_green_bearing: teeToGreenBearing,
+    greenside_bunkers: greensideBunkers,
+    left_side_bunkers: leftSideBunkers,
+    right_side_bunkers: rightSideBunkers,
+    approach_relevant_hazards: approachRelevantHazards,
+    tee_shot_relevant_hazards: teeShotRelevantHazards,
+    strategic_summary: strategicSummary,
     data_quality: {
       confidence: mappingStatus === "full" ? "high" : "medium",
       boundary_available: false,
