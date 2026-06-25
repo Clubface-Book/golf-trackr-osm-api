@@ -62,6 +62,13 @@ export async function getAiCaddyGeometry(input) {
   }
 
   const storedGeometry = parseStoredHoleGeometry(options.storedHoleGeometry);
+  console.log("[ai-caddy] stored_hole_geometry_parse_debug", {
+    stored_geometry_is_null: storedGeometry === null,
+    keys: storedGeometry ? Object.keys(storedGeometry) : null,
+    geometry_status: storedGeometry?.geometry_status ?? storedGeometry?.geometryStatus ?? null,
+    green_lat: storedGeometry?.green_lat ?? storedGeometry?.greenLat ?? null,
+    green_lng: storedGeometry?.green_lng ?? storedGeometry?.greenLng ?? null,
+  });
   if (storedGeometry) {
     const response = buildStoredAiCaddyResponse(storedGeometry, options);
     return withLog(response, {
