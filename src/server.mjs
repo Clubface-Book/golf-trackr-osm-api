@@ -130,6 +130,7 @@ app.post("/v1/geometry/ai-caddy", async (req, res) => {
     const body = req.body || {};
     console.log("[ai-caddy] raw_stored_hole_geometry_shape");
     console.dir(body.stored_hole_geometry, { depth: 4 });
+    console.log("[ai-caddy] raw_stored_hole_geometry", JSON.stringify(req.body.stored_hole_geometry, null, 2));
     const input = validateRequest(body);
     console.log("[ai-caddy] incoming", {
       course_name: input.courseName,
