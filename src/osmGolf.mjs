@@ -48,27 +48,7 @@ export async function getAiCaddyGeometry(input) {
     storedHoleGeometry: input.storedHoleGeometry,
   };
 
-  if (options.storedHoleGeometry && typeof options.storedHoleGeometry === "object") {
-    console.log("[ai-caddy] stored_hole_geometry_object_debug", {
-      keys: Object.keys(options.storedHoleGeometry),
-      geometry_status: options.storedHoleGeometry.geometry_status ?? options.storedHoleGeometry.geometryStatus ?? null,
-      green_lat: options.storedHoleGeometry.green_lat ?? options.storedHoleGeometry.greenLat ?? null,
-      green_lng: options.storedHoleGeometry.green_lng ?? options.storedHoleGeometry.greenLng ?? null,
-      green_lat_type: typeof (options.storedHoleGeometry.green_lat ?? options.storedHoleGeometry.greenLat),
-      green_lng_type: typeof (options.storedHoleGeometry.green_lng ?? options.storedHoleGeometry.greenLng),
-      route_json_exists: Object.prototype.hasOwnProperty.call(options.storedHoleGeometry, "route_json"),
-      green_json_exists: Object.prototype.hasOwnProperty.call(options.storedHoleGeometry, "green_json"),
-    });
-  }
-
   const storedGeometry = parseStoredHoleGeometry(options.storedHoleGeometry);
-  console.log("[ai-caddy] stored_hole_geometry_parse_debug", {
-    stored_geometry_is_null: storedGeometry === null,
-    keys: storedGeometry ? Object.keys(storedGeometry) : null,
-    geometry_status: storedGeometry?.geometry_status ?? storedGeometry?.geometryStatus ?? null,
-    green_lat: storedGeometry?.green_lat ?? storedGeometry?.greenLat ?? null,
-    green_lng: storedGeometry?.green_lng ?? storedGeometry?.greenLng ?? null,
-  });
   if (storedGeometry) {
     const response = buildStoredAiCaddyResponse(storedGeometry, options);
     return withLog(response, {
@@ -452,17 +432,6 @@ function buildAiCaddyResponse(geometry, options) {
       reason: "hole_geometry_missing",
     });
   }
-
-  console.log("[ai-caddy] course_cache_distance_debug", {
-    incoming_lat: options.lat,
-    incoming_lng: options.lng,
-    user_lat: options.lat,
-    user_lng: options.lng,
-    cached_green_lat: primaryGreen ? roundCoord(primaryGreen.center[1]) : null,
-    cached_green_lng: primaryGreen ? roundCoord(primaryGreen.center[0]) : null,
-    calculated_green_distance_from_user_yards: greenDistanceFromUserYards,
-    green_distance_included_in_response: Boolean(primaryGreen && Number.isFinite(greenDistanceFromUserYards)),
-  });
 
   return {
     ok: true,

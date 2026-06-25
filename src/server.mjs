@@ -128,15 +128,10 @@ app.post("/v1/courses/geometry/build", async (req, res) => {
 app.post("/v1/geometry/ai-caddy", async (req, res) => {
   try {
     const body = req.body || {};
-    console.log("[ai-caddy] raw_stored_hole_geometry_shape");
-    console.dir(body.stored_hole_geometry, { depth: 4 });
-    console.log("[ai-caddy] raw_stored_hole_geometry", JSON.stringify(req.body.stored_hole_geometry, null, 2));
     const input = validateRequest(body);
     console.log("[ai-caddy] incoming", {
       course_name: input.courseName,
       hole: input.hole,
-      incoming_lat: body.lat ?? body.latitude ?? null,
-      incoming_lng: body.lng ?? body.lon ?? body.longitude ?? null,
       user_lat: input.lat,
       user_lng: input.lng,
       stored_hole_geometry: Boolean(input.storedHoleGeometry),
@@ -201,31 +196,6 @@ function validateRequest(body) {
   if (!Number.isFinite(lng) || lng < -180 || lng > 180) {
     throw requestError("lng must be a valid longitude.", "invalid_lng");
   }
-
-  const storedGeometryKeys = ["stored_hole_geometry", "storedHoleGeometry", "course_hole_geometry"];
-  const storedGeometryDebug = Object.fromEntries(
-    storedGeometryKeys.map((key) => {
-      const exists = Object.prototype.hasOwnProperty.call(body, key);
-      const value = body[key];
-      const preview =
-        exists && value !== undefined
-          ? String(typeof value === "string" ? value : JSON.stringify(value)).slice(0, 300)
-          : null;
-
-      return [
-        key,
-        {
-          exists,
-          type: typeof value,
-          preview,
-        },
-      ];
-    }),
-  );
-  console.log("[ai-caddy] stored_hole_geometry_request_debug", {
-    body_keys: Object.keys(body),
-    stored_geometry_fields: storedGeometryDebug,
-  });
 
   return {
     courseName,
