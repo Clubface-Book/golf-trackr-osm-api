@@ -909,7 +909,7 @@ function buildBubbleGeometryResponse({ input, geometry, attemptedAt }) {
       source: "osm",
       attribution: ATTRIBUTION,
       features_count_json: stringifyJson(geometry.featureCounts),
-      hole_refs_found_json: stringifyJson(geometry.holeRefsFound),
+      hole_refs_found_json: stringifyJson(stringifyJson(geometry.holeRefsFound)),
       query_status_json: stringifyJson(geometry.queryStatuses || {}),
       quality_notes_json: stringifyJson(courseQualityNotes(mappingStatus, holeRecords, geometry)),
       raw_course_json: stringifyJson(rawCourseForBubble(geometry)),
