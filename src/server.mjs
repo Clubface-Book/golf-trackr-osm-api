@@ -199,6 +199,31 @@ function validateRequest(body) {
     throw requestError("lng must be a valid longitude.", "invalid_lng");
   }
 
+  const storedGeometryKeys = ["stored_hole_geometry", "storedHoleGeometry", "course_hole_geometry"];
+  const storedGeometryDebug = Object.fromEntries(
+    storedGeometryKeys.map((key) => {
+      const exists = Object.prototype.hasOwnProperty.call(body, key);
+      const value = body[key];
+      const preview =
+        exists && value !== undefined
+          ? String(typeof value === "string" ? value : JSON.stringify(value)).slice(0, 300)
+          : null;
+
+      return [
+        key,
+        {
+          exists,
+          type: typeof value,
+          preview,
+        },
+      ];
+    }),
+  );
+  console.log("[ai-caddy] stored_hole_geometry_request_debug", {
+    body_keys: Object.keys(body),
+    stored_geometry_fields: storedGeometryDebug,
+  });
+
   return {
     courseName,
     courseOsmId,
