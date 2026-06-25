@@ -415,6 +415,7 @@ function buildAiCaddyResponse(geometry, options) {
   const waterHazards = features.filter((feature) => isWaterKind(feature.kind));
   const primaryGreen = pickPrimaryGreen(greens, primaryRoute);
   const userPoint = [options.lng, options.lat];
+  const greenDistanceFromUserYards = primaryGreen ? yardsBetween(userPoint, primaryGreen.center) : null;
   const mappingStatus = classifyMappingStatus({
     geometry,
     holeRecord,
@@ -432,6 +433,17 @@ function buildAiCaddyResponse(geometry, options) {
     });
   }
 
+  console.log("[ai-caddy] course_cache_distance_debug", {
+    incoming_lat: options.lat,
+    incoming_lng: options.lng,
+    user_lat: options.lat,
+    user_lng: options.lng,
+    cached_green_lat: primaryGreen ? roundCoord(primaryGreen.center[1]) : null,
+    cached_green_lng: primaryGreen ? roundCoord(primaryGreen.center[0]) : null,
+    calculated_green_distance_from_user_yards: greenDistanceFromUserYards,
+    green_distance_included_in_response: Boolean(primaryGreen && Number.isFinite(greenDistanceFromUserYards)),
+  });
+
   return {
     ok: true,
     mapping_status: mappingStatus,
@@ -445,7 +457,7 @@ function buildAiCaddyResponse(geometry, options) {
       ? {
           osm_id: osmId(primaryGreen.element),
           center: latLng(primaryGreen.center),
-          distance_from_user_yards: yardsBetween(userPoint, primaryGreen.center),
+          distance_from_user_yards: greenDistanceFromUserYards,
           match: primaryGreen.match || null,
         }
       : null,

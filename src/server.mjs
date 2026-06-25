@@ -127,10 +127,15 @@ app.post("/v1/courses/geometry/build", async (req, res) => {
 
 app.post("/v1/geometry/ai-caddy", async (req, res) => {
   try {
-    const input = validateRequest(req.body || {});
+    const body = req.body || {};
+    const input = validateRequest(body);
     console.log("[ai-caddy] incoming", {
       course_name: input.courseName,
       hole: input.hole,
+      incoming_lat: body.lat ?? body.latitude ?? null,
+      incoming_lng: body.lng ?? body.lon ?? body.longitude ?? null,
+      user_lat: input.lat,
+      user_lng: input.lng,
       stored_hole_geometry: Boolean(input.storedHoleGeometry),
     });
 
