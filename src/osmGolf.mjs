@@ -981,6 +981,122 @@ function buildBubbleHoleGeometryRecord({ geometry, holeNumber, updatedAt }) {
   const waterRecords = waterHazards.map((feature) => ({ type: outputHazardType(feature.kind), ...bubbleFeature(feature) }));
   const fairwayRecords = fairways.map((feature) => bubbleFeature(feature));
   const hazardRecords = [...bunkerRecords, ...waterRecords];
+  const routeLine = primaryRoute?.line || [];
+  const teePoint = routeLine[0] || null;
+  const greenPoint = primaryGreen?.center || null;
+  const routeLengthMeters = routeLine.reduce((total, point, index) => {
+    if (index === 0) return total;
+    return total + distanceMeters(routeLine[index - 1], point);
+  }, 0);
+  const routeProjection = (point) => {
+    if (routeLine.length < 2) return null;
+
+    let best = null;
+    let cumulativeMeters = 0;
+
+    for (let index = 1; index < routeLine.length; index += 1) {
+      const start = routeLine[index - 1];
+      const end = routeLine[index];
+      const segmentMeters = distanceMeters(start, end);
+      const [px, py] = project(point);
+      const [sx, sy] = project(start);
+      const [ex, ey] = project(end);
+      const dx = ex - sx;
+      const dy = ey - sy;
+
+      if (dx === 0 && dy === 0) continue;
+
+      const t = Math.max(0, Math.min(1, ((px - sx) * dx + (py - sy) * dy) / (dx * dx + dy * dy)));
+      const projectedX = sx + t * dx;
+      const projectedY = sy + t * dy;
+      const offsetMeters = Math.hypot(px - projectedX, py - projectedY);
+      const cross = dx * (py - sy) - dy * (px - sx);
+      const side = Math.abs(cross) < 1e-6 ? "on_route" : cross > 0 ? "left" : "right";
+
+      if (!best || offsetMeters < best.offsetMeters) {
+        best = {
+          alongMeters: cumulativeMeters + segmentMeters * t,
+          offsetMeters,
+          side,
+        };
+      }
+
+      cumulativeMeters += segmentMeters;
+    }
+
+    return best;
+  };
+  const enrichStaticHazard = (record) => {
+    const centerPoint = [record.center.lng, record.center.lat];
+    const projection = routeProjection(centerPoint);
+    const teeToHazardYards = projection
+      ? Math.round(projection.alongMeters * YARDS_PER_METER)
+      : teePoint
+        ? yardsBetween(teePoint, centerPoint)
+        : null;
+    const routeOffsetYards = projection ? Math.round(projection.offsetMeters * YARDS_PER_METER) : null;
+    const positionAlongHolePercent =
+      projection && routeLengthMeters > 0
+        ? Math.max(0, Math.min(100, Math.round((projection.alongMeters / routeLengthMeters) * 100)))
+        : null;
+
+    return {
+      type: outputHazardType(record.type),
+      osm_id: record.osm_id,
+      center: record.center,
+      tee_to_hazard_yards: teeToHazardYards,
+      green_to_hazard_yards: greenPoint ? yardsBetween(centerPoint, greenPoint) : null,
+      side_of_route: projection?.side || "unknown",
+      route_offset_yards: routeOffsetYards,
+      position_along_hole_percent: positionAlongHolePercent,
+      match: record.match || null,
+    };
+  };
+  const staticBunkers = bunkerRecords.map(enrichStaticHazard);
+  const staticWaterHazards = waterRecords.map(enrichStaticHazard);
+  const staticHazards = [...staticBunkers, ...staticWaterHazards];
+  const byGreenDistance = (a, b) => (a.green_to_hazard_yards ?? Infinity) - (b.green_to_hazard_yards ?? Infinity);
+  const byTeeDistance = (a, b) => (a.tee_to_hazard_yards ?? Infinity) - (b.tee_to_hazard_yards ?? Infinity);
+  const nearestBunkers = [...staticBunkers].sort(byGreenDistance).slice(0, DEFAULT_MAX_HAZARDS);
+  const nearestWaterHazards = [...staticWaterHazards].sort(byGreenDistance).slice(0, DEFAULT_MAX_HAZARDS);
+  const greensideBunkers = staticBunkers
+    .filter((hazard) => (hazard.green_to_hazard_yards ?? Infinity) <= 60)
+    .sort(byGreenDistance)
+    .slice(0, DEFAULT_MAX_HAZARDS);
+  const approachRelevantHazards = staticHazards
+    .filter((hazard) => {
+      const nearGreen = (hazard.green_to_hazard_yards ?? Infinity) <= 100;
+      const finalApproach =
+        (hazard.position_along_hole_percent ?? 0) >= 65 && (hazard.route_offset_yards ?? Infinity) <= 100;
+      return nearGreen || finalApproach;
+    })
+    .sort(byGreenDistance)
+    .slice(0, DEFAULT_MAX_HAZARDS);
+  const strategicSummary = [];
+
+  if (greensideBunkers.length) {
+    strategicSummary.push(
+      `${greensideBunkers.length} greenside bunker(s) appear within approximately 60 yards of the green, based on stored centre-point geometry.`,
+    );
+  }
+
+  if (approachRelevantHazards.length) {
+    strategicSummary.push(
+      `${approachRelevantHazards.length} hazard(s) likely relate to the approach or green complex, based on stored centre-point geometry.`,
+    );
+  }
+
+  if (nearestWaterHazards.length) {
+    strategicSummary.push(`${nearestWaterHazards.length} water hazard(s) are stored for this hole.`);
+  }
+
+  if (!strategicSummary.length && (staticBunkers.length || staticWaterHazards.length)) {
+    strategicSummary.push("Stored hazard geometry is available for this hole, using centre-point approximations.");
+  }
+
+  if (!strategicSummary.length) {
+    strategicSummary.push("No bunker or water hazard geometry is stored for this hole.");
+  }
   const notes =
     geometryStatus === "missing"
       ? ["No usable OSM geometry found for this hole."]
@@ -1005,6 +1121,11 @@ function buildBubbleHoleGeometryRecord({ geometry, holeNumber, updatedAt }) {
     fairway_json: stringifyJson(fairwayRecords),
     fairway_json_text: stringifyJson(stringifyJson(fairwayRecords)),
     green_json: stringifyJson(green || {}),
+    nearest_bunkers: nearestBunkers,
+    nearest_water_hazards: nearestWaterHazards,
+    greenside_bunkers: greensideBunkers,
+    approach_relevant_hazards: approachRelevantHazards,
+    strategic_summary: strategicSummary,
     geometry_status: geometryStatus,
     quality_notes_json: stringifyJson(notes),
     last_updated_at: updatedAt,
